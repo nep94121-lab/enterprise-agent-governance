@@ -67,6 +67,22 @@ EAGF was engineered after an exhaustive audit of over **100 leading open-source 
 
 ---
 
+## 🔌 Universal Compatibility: Built on Google Antigravity & Portable to All Coding Agents
+
+> **Built for Google Antigravity — Engineered for the Entire Autonomous Ecosystem.**
+
+While EAGF was originally designed, battle-tested, and optimized inside **Google Antigravity (AGY / Antigravity IDE & SDK)** leveraging its native `hooks.json` event-bus and subagent delegation mechanisms, **its modular architecture is 100% platform-agnostic and universally compatible with all modern coding agents and multi-agent platforms**:
+
+| Coding Agent / Platform | Integration Mechanism | Enforced Capabilities |
+|---|---|---|
+| 🌌 **Google Antigravity (AGY)** | **Native Event-Bus:** Direct integration via `hooks.json` (`PreToolUse`, `PostToolUse`, `Stop`) in workspace or global config. | Full 51 Physical Hooks, Dual-Pool Cap 20, Canary Proof-of-Reading Gate, 7 Phase Gates |
+| 🤖 **Claude Code (Anthropic)** | **Tool Interceptors & System Prompt:** Wrap execution commands in CLI bash wrappers; inject role rules via `CLAUDE.md`. | Process-level Hard Deny, secret sanitization, anti-sequential delegation |
+| ⚡ **Cursor & Windsurf IDEs** | **Rule Specs & Pre-Commit:** Import role rules directly into `.cursorrules` or `.windsurfrules`; run hooks via workspace tasks. | Strict file ownership, role discipline, AST assertion analysis |
+| 💻 **Aider / OpenCode / RooCode** | **System Instruction Injection:** Point system prompts to `rules/` and run `hooks_scripts/` as pre-execution command checks. | Anti-overengineering guardrails, supply chain pinning, zero-drift policy |
+| 🐍 **LangGraph / CrewAI / AutoGen** | **Python Middleware Hooks:** Import `hooks/hook_utils/` directly into Python graph nodes and agent lifecycle listeners. | Dynamic 3-Zone CPU Governor, circuit breakers, working memory compaction |
+
+---
+
 ## 🏛️ 3-Tier Hierarchical Architecture
 
 EAGF organizes agent fleets into an immutable hierarchy with strict separation of concerns and an enforced **No-Code Policy for Orchestrators**:
