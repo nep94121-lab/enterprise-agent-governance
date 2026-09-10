@@ -1,0 +1,165 @@
+# ==============================================================================
+# UNIVERSAL MULTI-AGENT GOVERNANCE KIT — PROJECT CONFIGURATION TEMPLATE
+# File: project-hooks.yaml (Copy to the root directory of your project as project-hooks.yaml)
+# ==============================================================================
+# This configuration file governs multi-agent execution, lifecycle hooks,
+# security defenses (3-Layer Security Model), token budgets, git branch policies,
+# and quality gating across all AI agents and developers on this project.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Project Identification
+# ------------------------------------------------------------------------------
+project:
+  # Name of your application or repository
+  name: "Enterprise Application"
+  # Short project code or ticket prefix
+  id: "PROJ-001"
+  # Brief description of the project scope
+  description: "Enterprise application governed by Multi-Agent Governance Kit"
+
+# ------------------------------------------------------------------------------
+# 2. Git & Repository Hygiene Policy (§11, §13, §29)
+# ------------------------------------------------------------------------------
+git:
+  # Branch control: List of branches allowed for git push.
+  # Use ["*"] to allow pushing to any feature branch, or specify explicit branches.
+  # Example: ["main", "develop", "feature/*", "bugfix/*"]
+  allowed_push_branches:
+    - "*"
+
+  # Protected branches: Direct git push to these branches is strictly blocked.
+  # Changes to these branches MUST go through pull request (PR) reviews.
+  prohibited_push_branches:
+    - "main"
+    - "master"
+    - "prod"
+    - "production"
+    - "release"
+
+  # Force-push prevention: Prohibits git push with -f, --force, --delete, or +refspec.
+  prohibit_force_push: true
+
+  # Optional commit author validation
+  author_validation:
+    enabled: false
+    allowed_email_domains:
+      - "company.com"
+
+# ------------------------------------------------------------------------------
+# 3. Security & Boundary Defense (3-Layer Security Architecture)
+# ------------------------------------------------------------------------------
+security:
+  # Multi-tenant IDOR & Authorization Boundary Defense (Layer 3, §1, §24)
+  multi_tenant:
+    # Enable automatic inspection of tenant boundary filters in database queries
+    enabled: true
+
+    # Tenant identifier column names that MUST be present in WHERE clauses
+    tenant_id_fields:
+      - "tenant_id"
+      - "organization_id"
+      - "project_id"
+      - "ownership_id"
+      - "account_id"
+
+    # Business entity tables requiring tenant boundary isolation
+    protected_tables:
+      - "users"
+      - "accounts"
+      - "orders"
+      - "contracts"
+      - "invoices"
+      - "tenants"
+      - "residents"
+
+    # ORM model class names corresponding to protected tables
+    protected_models:
+      - "User"
+      - "Account"
+      - "Order"
+      - "Contract"
+      - "Invoice"
+      - "Tenant"
+      - "Resident"
+
+    # API route path prefixes requiring authentication and tenant context dependencies
+    protected_route_prefixes:
+      - "/api/v1/protected"
+      - "/admin"
+      - "/api/v1/billing"
+
+  # Static Diff & Secrets Scanner (Layer 2, §2, §3)
+  secrets_scanner:
+    # Enable scanning of git diffs and modified files for API keys and tokens
+    enabled: true
+    # Block git commit or push if high-entropy secrets or private keys are detected
+    block_on_critical: true
+    # Whitelisted dummy substrings permitted in unit tests and mock fixtures
+    allowed_substrings:
+      - "your_secret"
+      - "dummy_token"
+      - "placeholder_key"
+      - "test_secret"
+
+  # Database Security Governance (§2)
+  database:
+    # Strictly forbid hardcoded database passwords or connection URLs in code & markdown
+    enforce_env_only: true
+
+# ------------------------------------------------------------------------------
+# 4. Testing & Quality Gates (7 Phase Gates Workflow, §19, §20, §22)
+# ------------------------------------------------------------------------------
+testing:
+  # Pre-Push Automated Test Enforcer (Layer 3)
+  test_runner:
+    # Command executed before git push; must pass 100% (exit code 0)
+    command: "pytest tests/ -q --tb=short"
+    # Execution timeout in seconds
+    timeout_seconds: 60
+    # Environment variable to bypass pre-push test gate when emergency hotfixing
+    bypass_env_var: "SKIP_PRE_PUSH_TEST"
+
+  # Token Budget Allocations per Role & File (§4)
+  token_budget:
+    # Maximum token count allowed for a single rule/guideline markdown file
+    max_rule_file_tokens: 4000
+    # Maximum cumulative token allocation per role folder
+    max_role_tokens: 12000
+    # Warning threshold percentage (e.g., 0.8 = 80% of budget)
+    warning_threshold: 0.8
+    # Critical threshold percentage (e.g., 0.95 = 95% of budget)
+    critical_threshold: 0.95
+    # Token limits per standard role
+    roles:
+      pm_orchestrator: 12000
+      backend_developer: 12000
+      frontend_developer: 12000
+      devops_security: 12000
+      qa_challenger: 12000
+      tech_lead_auditor: 12000
+
+  # QA Challenger Confidence Scoring (0–100 scale)
+  confidence_scoring:
+    # Minimum score required for a defect to block PR merge (default: 80)
+    # 0: False Positive | 25: Unclear | 50: Minor | 75: Regression | 80: Default Gate | 100: Critical Crash/PoC
+    block_merge_threshold: 80
+    default_threshold: 80
+
+# ------------------------------------------------------------------------------
+# 5. Agent Lifecycle Reminders (Injected Context for Autonomous Agents)
+# ------------------------------------------------------------------------------
+reminders:
+  session_start:
+    title: "🔒 [ENTERPRISE GOVERNANCE REMINDER - SESSION START]"
+    clauses:
+      - "Security (§1-§2): Zero raw PII logging, zero hardcoded secrets in code."
+      - "Quality & Hygiene (§11, §13): No 'git add .', 0 trailing spaces, 0 blank EOF lines."
+      - "Architecture (§15): .agents/ holds only metadata, no source code."
+      - "Pre-Flight (§28-§29): Review empirical git diff and verify 100% test coverage."
+  heartbeat:
+    title: "⏱️ [HEARTBEAT REMINDER]"
+    clauses:
+      - "Liveness: Update progress.md with timestamp heartbeat on significant steps."
+      - "Timer Discipline: Enforce 1m (small), 2m (medium), 3m (large) task timers."
+      - "Resource Cleanup (§29): Kill background tasks and clean temporary files."

@@ -1,0 +1,119 @@
+{
+  "$schema": "./governance.config.schema.json",
+  "project": {
+    "name": "Enterprise Application",
+    "id": "PROJ-001",
+    "description": "Enterprise application governed by Multi-Agent Governance Kit"
+  },
+  "git": {
+    "allowed_push_branches": [
+      "*"
+    ],
+    "prohibited_push_branches": [
+      "main",
+      "master",
+      "prod",
+      "production",
+      "release"
+    ],
+    "prohibit_force_push": true,
+    "author_validation": {
+      "enabled": false,
+      "allowed_email_domains": [
+        "company.com"
+      ]
+    }
+  },
+  "security": {
+    "multi_tenant": {
+      "enabled": true,
+      "tenant_id_fields": [
+        "tenant_id",
+        "organization_id",
+        "project_id",
+        "ownership_id",
+        "account_id"
+      ],
+      "protected_tables": [
+        "users",
+        "accounts",
+        "orders",
+        "contracts",
+        "invoices",
+        "tenants",
+        "residents"
+      ],
+      "protected_models": [
+        "User",
+        "Account",
+        "Order",
+        "Contract",
+        "Invoice",
+        "Tenant",
+        "Resident"
+      ],
+      "protected_route_prefixes": [
+        "/api/v1/protected",
+        "/admin",
+        "/api/v1/billing"
+      ]
+    },
+    "secrets_scanner": {
+      "enabled": true,
+      "block_on_critical": true,
+      "allowed_substrings": [
+        "your_secret",
+        "dummy_token",
+        "placeholder_key",
+        "test_secret"
+      ]
+    },
+    "database": {
+      "enforce_env_only": true
+    }
+  },
+  "testing": {
+    "test_runner": {
+      "command": "pytest tests/ -q --tb=short",
+      "timeout_seconds": 60,
+      "bypass_env_var": "SKIP_PRE_PUSH_TEST"
+    },
+    "token_budget": {
+      "max_rule_file_tokens": 4000,
+      "max_role_tokens": 12000,
+      "warning_threshold": 0.8,
+      "critical_threshold": 0.95,
+      "roles": {
+        "pm_orchestrator": 12000,
+        "backend_developer": 12000,
+        "frontend_developer": 12000,
+        "devops_security": 12000,
+        "qa_challenger": 12000,
+        "tech_lead_auditor": 12000
+      }
+    },
+    "confidence_scoring": {
+      "block_merge_threshold": 80,
+      "default_threshold": 80
+    }
+  },
+  "reminders": {
+    "session_start": {
+      "title": "🔒 [ENTERPRISE GOVERNANCE REMINDER - SESSION START]",
+      "clauses": [
+        "Security (§1-§2): Zero raw PII logging, zero hardcoded secrets in code.",
+        "Quality & Hygiene (§11, §13): No 'git add .', 0 trailing spaces, 0 blank EOF lines.",
+        "Architecture (§15): .agents/ holds only metadata, no source code.",
+        "Pre-Flight (§28-§29): Review empirical git diff and verify 100% test coverage."
+      ]
+    },
+    "heartbeat": {
+      "title": "⏱️ [HEARTBEAT REMINDER]",
+      "clauses": [
+        "Liveness: Update progress.md with timestamp heartbeat on significant steps.",
+        "Timer Discipline: Enforce 1m (small), 2m (medium), 3m (large) task timers.",
+        "Resource Cleanup (§29): Kill background tasks and clean temporary files."
+      ]
+    }
+  }
+}

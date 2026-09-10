@@ -1,0 +1,43 @@
+"""Universal Multi-Agent Governance Kit — Hooks Scripts Package."""
+
+from hooks_scripts.config_loader import (
+    ConfidenceScoringConfig,
+    GitAuthorValidationConfig,
+    GitConfig,
+    GovernanceConfig,
+    MultiTenantConfig,
+    ProjectConfig,
+    RemindersConfig,
+    SchemaValidationError,
+    SecretsScannerConfig,
+    SecurityConfig,
+    TestingConfig,
+    TestRunnerConfig,
+    TokenBudgetConfig,
+    find_config_file,
+    get_governance_config,
+    load_governance_config,
+    validate_config_dict,
+    validate_config_schema,
+)
+
+__all__ = [
+    "ConfidenceScoringConfig",
+    "GitAuthorValidationConfig",
+    "GitConfig",
+    "GovernanceConfig",
+    "MultiTenantConfig",
+    "ProjectConfig",
+    "RemindersConfig",
+    "SchemaValidationError",
+    "SecretsScannerConfig",
+    "SecurityConfig",
+    "TestRunnerConfig",
+    "TestingConfig",
+    "TokenBudgetConfig",
+    "find_config_file",
+    "get_governance_config",
+    "load_governance_config",
+    "validate_config_dict",
+    "validate_config_schema",
+]

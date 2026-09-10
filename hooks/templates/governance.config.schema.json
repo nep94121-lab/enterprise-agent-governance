@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://enterprise-governance.dev/schemas/governance.config.schema.json",
+  "title": "Universal Multi-Agent Governance Configuration Schema",
+  "description": "Schema definition and validation constraints for Universal Multi-Agent Governance Kit configuration files.",
+  "type": "object",
+  "properties": {
+    "project": {
+      "type": "object",
+      "description": "Project metadata and identification",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Descriptive name of the governed project",
+          "default": "Enterprise Application"
+        },
+        "id": {
+          "type": "string",
+          "description": "Unique identifier or ticket prefix for the project",
+          "default": "PROJ-001"
+        },
+        "description": {
+          "type": "string",
+          "description": "Brief description of the application scope",
+          "default": "Enterprise application governed by Multi-Agent Governance Kit"
+        }
+      },
+      "additionalProperties": true
+    },
+    "git": {
+      "type": "object",
+      "description": "Git repository hygiene, branch restrictions, and force-push guards (§11, §13, §29)",
+      "properties": {
+        "allowed_push_branches": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Branches permitted for direct or branch pushes (supports wildcard '*')"
+        },
+        "prohibited_push_branches": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Protected branches where direct pushes are strictly prohibited"
+        },
+        "prohibit_force_push": {
+          "type": "boolean",
+          "description": "Block any git push command using force flags (-f, --force, --delete, +ref)",
+          "default": true
+        },
+        "author_validation": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "allowed_email_domains": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "security": {
+      "type": "object",
+      "description": "3-Layer Security Architecture configurations",
+      "properties": {
+        "multi_tenant": {
+          "type": "object",
+          "description": "Layer 3: Multi-tenant boundary and IDOR defense configurations (§1, §24)",
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "tenant_id_fields": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "protected_tables": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "protected_models": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "protected_route_prefixes": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": true
+        },
+        "secrets_scanner": {
+          "type": "object",
+          "description": "Layer 2: Static diff and secrets detection scanner (§2, §3)",
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "block_on_critical": { "type": "boolean", "default": true },
+            "allowed_substrings": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": true
+        },
+        "database": {
+          "type": "object",
+          "description": "Database connection and credential management rules (§2)",
+          "properties": {
+            "enforce_env_only": {
+              "type": "boolean",
+              "description": "Enforce loading database credentials strictly from environment variables",
+              "default": true
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "testing": {
+      "type": "object",
+      "description": "Testing runners, token budgets, and confidence scoring gates (§19, §20, §22)",
+      "properties": {
+        "test_runner": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "default": "pytest tests/ -q --tb=short"
+            },
+            "timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 60
+            },
+            "bypass_env_var": {
+              "type": "string",
+              "default": "SKIP_PRE_PUSH_TEST"
+            }
+          },
+          "additionalProperties": true
+        },
+        "token_budget": {
+          "type": "object",
+          "description": "Token budget restrictions per file and role (§4)",
+          "properties": {
+            "max_rule_file_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 4000
+            },
+            "max_file_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 4000
+            },
+            "max_role_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 12000
+            },
+            "warning_threshold": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0,
+              "default": 0.8
+            },
+            "critical_threshold": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0,
+              "default": 0.95
+            },
+            "roles": {
+              "type": "object",
+              "properties": {
+                "pm_orchestrator": { "type": "integer", "minimum": 1 },
+                "backend_developer": { "type": "integer", "minimum": 1 },
+                "frontend_developer": { "type": "integer", "minimum": 1 },
+                "devops_security": { "type": "integer", "minimum": 1 },
+                "qa_challenger": { "type": "integer", "minimum": 1 },
+                "tech_lead_auditor": { "type": "integer", "minimum": 1 }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": true
+        },
+        "confidence_scoring": {
+          "type": "object",
+          "description": "Confidence Scoring scale (0-100) for QA Challenger gate enforcement",
+          "properties": {
+            "block_merge_threshold": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 80
+            },
+            "default_threshold": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 80
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "reminders": {
+      "type": "object",
+      "description": "Lifecycle reminders injected into agent prompts",
+      "properties": {
+        "session_start": {
+          "type": "object",
+          "properties": {
+            "title": { "type": "string" },
+            "clauses": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": true
+        },
+        "heartbeat": {
+          "type": "object",
+          "properties": {
+            "title": { "type": "string" },
+            "clauses": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

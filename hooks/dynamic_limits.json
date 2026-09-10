@@ -1,0 +1,688 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "hardware_profile": {
+    "auto_detect": true,
+    "dynamic_sensing": true,
+    "cpu_cores_physical": 4,
+    "cpu_threads_logical": 8,
+    "optimal_cpu_load_min_percent": 60.0,
+    "optimal_cpu_load_max_percent": 85.0,
+    "governor_policy": "dynamic_workload_sensing",
+    "notes": "Dynamic auto-sensing enabled. Sensed at runtime via os.cpu_count() and psutil. Values represent baseline defaults."
+  },
+  "concurrency_rules": {
+    "pool_1_cloud_thinking_max_subagents": 20,
+    "pool_2_local_burst_concurrent_slots": 3,
+    "cooldown_sleep_seconds_on_high_load": 1.0,
+    "atomic_workload_threshold": 2,
+    "sliding_window_seconds": 1800,
+    "workspace_backlog_threshold": 5
+  },
+  "execution_timeouts": {
+    "read_io_timeout_seconds": 15,
+    "light_command_timeout_seconds": 30,
+    "heavy_build_timeout_seconds": 180
+  },
+  "scope_boundary": {
+    "monitored_tools": [
+      "write_to_file",
+      "replace_file_content",
+      "multi_replace_file_content"
+    ],
+    "target_argument_keys": [
+      "TargetFile",
+      "target_file",
+      "filePath",
+      "file_path",
+      "path",
+      "destination"
+    ],
+    "metadata_directories": [
+      ".agents"
+    ],
+    "allowed_metadata_extensions": [
+      ".md",
+      ".json",
+      ".jsonl",
+      ".ndjson",
+      ".yaml",
+      ".yml",
+      ".txt",
+      ".log",
+      ".csv",
+      ".toml",
+      ".xml",
+      ".dot",
+      ".svg",
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".gitkeep",
+      ".gitignore"
+    ],
+    "prohibited_source_extensions": [
+      ".py",
+      ".ts",
+      ".tsx",
+      ".js",
+      ".jsx",
+      ".sh",
+      ".ps1",
+      ".bat",
+      ".cmd",
+      ".c",
+      ".cpp",
+      ".rs",
+      ".go",
+      ".java",
+      ".sql",
+      ".php",
+      ".rb",
+      ".cs",
+      ".kt",
+      ".kts",
+      ".swift",
+      ".dart",
+      ".lua",
+      ".r",
+      ".m",
+      ".zig",
+      ".nim",
+      ".scala",
+      ".ex",
+      ".exs",
+      ".erl",
+      ".clj"
+    ]
+  },
+  "self_healing": {
+    "enabled": true,
+    "max_healing_attempts": 3,
+    "auto_fix_allowed": true,
+    "confidence_threshold": 0.8,
+    "max_suggestions_per_error": 5,
+    "matrix_config_file": "self_healing_matrix.json",
+    "cooldown_seconds_between_retries": 1.5
+  },
+  "reminders": {
+    "reminder_interval": 1,
+    "enable_turn_0_reminder": true,
+    "enable_heartbeat_reminder": true,
+    "session_start_title": "🔒 [ENTERPRISE GOVERNANCE REMINDER - SESSION START]",
+    "session_start_clauses": [
+      "1. Git Push Rule: Adhere to project Git push policy (§11).",
+      "2. Security (§1-§2): Zero raw PII logging, zero hardcoded secrets in code.",
+      "3. Quality & Hygiene (§11, §13): No 'git add .', 0 trailing spaces, 0 blank EOF lines.",
+      "4. Architecture (§15): .agents/ holds only metadata (plans/progress/handoffs), no source code.",
+      "5. Pre-Flight (§28-§29): Review empirical git diff and verify 100% test coverage before completion."
+    ],
+    "heartbeat_title": "⏱️ [ENTERPRISE HEARTBEAT REMINDER - INVOCATION #{invocation_num}]",
+    "heartbeat_clauses": [
+      "1. Liveness: Update progress.md with timestamp heartbeat on significant steps.",
+      "2. Timer Discipline: Enforce 1m (small), 2m (medium), 3m (large) task timers.",
+      "3. Resource Cleanup (§29): Kill background tasks and clean temporary files before wrapping up."
+    ]
+  },
+  "context_compression": {
+    "enabled": true,
+    "min_savings_ratio_percent": 15.0,
+    "target_savings_ratio_percent": 25.0,
+    "max_consecutive_blank_lines": 1,
+    "max_separator_chars": 3,
+    "condense_markdown_tables": true,
+    "condense_code_comments": true,
+    "max_table_col_width": 40,
+    "deduplicate_repeated_lines": true,
+    "collapse_duplicate_log_threshold": 3,
+    "mask_sensitive_pii": true,
+    "truncate_base64_threshold_chars": 100,
+    "preserve_code_blocks": true
+  },
+  "audit_trail": {
+    "log_dir": "logs/audit",
+    "max_file_size_mb": 100,
+    "rotation_enabled": true,
+    "index_enabled": true,
+    "max_index_entries": 10000,
+    "sanitize_pii": true,
+    "lock_timeout_seconds": 10.0,
+    "query_default_limit": 1000
+  },
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "recovery_timeout_seconds": 30.0,
+    "half_open_max_trials": 3,
+    "consecutive_success_threshold": 2,
+    "rolling_window_size": 20,
+    "failure_rate_threshold": 0.5
+  },
+  "hallucination_guard": {
+    "enabled": true,
+    "strict_mode": true,
+    "inspect_tools": [
+      "view_file",
+      "replace_file_content",
+      "read_file",
+      "get_code_snippet"
+    ],
+    "file_creation_tools": [
+      "write_to_file"
+    ],
+    "check_command_scripts": true,
+    "suggest_corrections": true,
+    "max_suggestions": 3,
+    "fuzzy_cutoff": 0.6,
+    "allowed_virtual_schemes": [
+      "memory:",
+      "virtual:",
+      "tmp:",
+      "temp:"
+    ]
+  },
+  "regression_detector": {
+    "enabled": true,
+    "hash_algorithm": "sha256",
+    "snapshot_store_dir": ".regression_snapshots",
+    "max_diff_lines": 5000,
+    "max_file_size_bytes": 10485760,
+    "block_on_untracked_drift": true,
+    "block_on_checksum_mismatch": true,
+    "syntax_verification_enabled": true,
+    "protected_paths": [
+      "rules_by_role",
+      "governance.config.schema.json"
+    ],
+    "excluded_patterns": [
+      ".git",
+      "__pycache__",
+      "*.pyc",
+      ".pytest_cache",
+      ".ruff_cache",
+      "node_modules",
+      ".venv",
+      "venv",
+      ".anti_sequential",
+      ".burst_guard",
+      ".regression_snapshots"
+    ]
+  },
+  "token_budget": {
+    "enabled": true,
+    "default_context_window": 1000000,
+    "warning_threshold_ratio": 0.8,
+    "critical_threshold_ratio": 0.95,
+    "exhausted_threshold_ratio": 1.0,
+    "max_rule_file_tokens": 4000,
+    "max_role_tokens": 12000,
+    "target_role_tokens": 7000,
+    "max_single_message_tokens": 8000,
+    "verbosity_warning_tokens": 6000,
+    "ratios": {
+      "ascii_chars_per_token": 4.0,
+      "code_symbol_chars_per_token": 2.5,
+      "vietnamese_accented_chars_per_token": 1.5,
+      "cjk_chars_per_token": 1.2,
+      "whitespace_chars_per_token": 4.0,
+      "default_chars_per_token": 3.5
+    },
+    "role_budgets": {
+      "pm_orchestrator": 15000,
+      "backend_developer": 12000,
+      "frontend_developer": 12000,
+      "devops_security": 12000,
+      "qa_challenger": 15000,
+      "tech_lead_auditor": 12000,
+      "pm": 15000,
+      "dev": 12000,
+      "qa": 15000,
+      "tl": 12000
+    },
+    "state_storage_dir": ".token_budget",
+    "state_file_name": "governor_state.json",
+    "rolling_window_seconds": 3600
+  },
+  "session_compaction": {
+    "enabled": true,
+    "default_max_tokens": 1000000,
+    "default_max_messages": 200,
+    "summarization_threshold": 0.7,
+    "compaction_threshold": 0.8,
+    "target_capacity_ratio": 0.5,
+    "min_messages_to_summarize": 10,
+    "max_summary_preview_length": 200,
+    "state_storage_dir": ".session_compactor",
+    "model_context_windows": {
+      "flash": 1048576,
+      "pro": 2097152,
+      "gemini-2.0-flash": 1048576,
+      "gemini-2.5-flash": 1048576,
+      "gemini-3.0-flash": 1048576,
+      "gemini-3.8-flash": 1048576,
+      "gemini-1.5-pro": 2097152,
+      "gemini-2.5-pro": 2097152,
+      "gemini-3.1-pro": 2097152,
+      "default": 1000000
+    },
+    "critical_keywords": [
+      "error",
+      "exception",
+      "failed",
+      "fatal",
+      "critical",
+      "important",
+      "must",
+      "required",
+      "do not",
+      "never",
+      "decision",
+      "conclusion",
+      "final",
+      "approved"
+    ],
+    "high_importance_keywords": [
+      "result",
+      "completed",
+      "success",
+      "implemented",
+      "created",
+      "modified",
+      "updated",
+      "changed",
+      "answer",
+      "response",
+      "output"
+    ],
+    "low_importance_keywords": [
+      "ok",
+      "okay",
+      "sure",
+      "yes",
+      "no",
+      "thanks",
+      "please",
+      "help",
+      "what about",
+      "maybe"
+    ]
+  },
+  "mcp_health_checker": {
+    "check_interval_seconds": 60,
+    "failure_threshold": 3,
+    "degraded_threshold": 1,
+    "latency_window_size": 100,
+    "max_window_size": 1000,
+    "enable_trend_analysis": true,
+    "default_warning_latency_ms": 1000.0,
+    "default_critical_latency_ms": 5000.0,
+    "default_availability_warning": 95.0,
+    "default_availability_critical": 90.0,
+    "timeout_seconds": 5.0,
+    "min_samples_for_trend": 10,
+    "trend_change_threshold": 10.0,
+    "trend_confidence_divisor": 50.0,
+    "trend_confidence_min": 0.7,
+    "max_results_history": 100,
+    "max_alerts_history": 1000,
+    "default_history_limit": 100,
+    "availability_recommendation_threshold": 95.0
+  },
+  "test_runner": {
+    "timeout_seconds": 30,
+    "max_summary_lines": 10,
+    "max_output_chars": 1000,
+    "excluded_filenames": [
+      "__init__.py",
+      "conftest.py",
+      "setup.py",
+      "fixtures.py"
+    ]
+  },
+  "trajectory_guard": {
+    "enabled": true,
+    "high_step_warning_threshold": 35,
+    "critical_step_threshold": 50,
+    "consecutive_tool_loop_threshold": 3,
+    "ping_pong_loop_threshold": 3,
+    "repeated_call_alert_enabled": true,
+    "inject_warning_on_loop": true,
+    "inject_warning_on_critical_steps": true,
+    "max_history_window": 20,
+    "state_storage_dir": ".trajectory_guard",
+    "state_file_name": "trajectory_state.json"
+  },
+  "pre_stop_audit": {
+    "enabled": true,
+    "enforce_fully_idle": true,
+    "check_background_tasks": true,
+    "check_git_cleanliness": true,
+    "git_status_timeout_seconds": 10,
+    "untracked_junk_extensions": [
+      ".tmp",
+      ".bak",
+      ".swp",
+      ".temp",
+      ".orig",
+      ".rej",
+      ".pyc"
+    ],
+    "untracked_junk_prefixes": [
+      "temp_",
+      "tmp_",
+      "~$"
+    ],
+    "untracked_junk_patterns": [
+      "*.tmp",
+      "*.bak",
+      "*.swp",
+      "*~",
+      "*.temp",
+      "temp_*",
+      "tmp_*",
+      "~*"
+    ],
+    "ignored_paths": [
+      ".git",
+      "node_modules",
+      ".pytest_cache",
+      ".ruff_cache",
+      "__pycache__",
+      ".venv",
+      "venv",
+      ".gemini"
+    ],
+    "allowed_exceptions": [
+      "templates",
+      "template",
+      "attempt"
+    ],
+    "rejection_messages": {
+      "active_tasks": "❌ PRE-STOP AUDIT FAILED: Active background tasks or asynchronous processes are still running. Please terminate all background processes using 'manage_task' action='kill' or wait for completion (§29).",
+      "untracked_junk": "❌ PRE-STOP AUDIT FAILED (Zero-Garbage §29): Untracked temporary/junk artifacts detected in working tree: {junk_list}. Please clean up temporary files (.tmp, .bak, temp) before terminating."
+    }
+  },
+  "format_check": {
+    "enabled": true,
+    "max_file_size_bytes": 10485760,
+    "file_encoding": "utf-8",
+    "monitored_tools": [
+      "write_to_file",
+      "replace_file_content",
+      "multi_replace_file_content"
+    ],
+    "target_argument_keys": [
+      "TargetFile",
+      "target_file",
+      "filePath",
+      "file_path",
+      "path",
+      "paths",
+      "files"
+    ],
+    "markdown": {
+      "enabled": true,
+      "extensions": [
+        ".md",
+        ".markdown",
+        ".mdown",
+        ".mkd"
+      ],
+      "strip_trailing_spaces": true,
+      "normalize_eof_newlines": true,
+      "preserve_empty_files": true,
+      "trailing_whitespace_chars": " \t\r"
+    },
+    "json": {
+      "enabled": true,
+      "extensions": [
+        ".json",
+        ".jsonc"
+      ],
+      "validate_syntax": true,
+      "allow_empty": false
+    },
+    "error_messages": {
+      "syntax_error": "JSON Syntax Error in {file_name}: line {line}, col {col}: {msg}",
+      "file_too_large": "Format Check: File {file_name} ({size} bytes) exceeds max limit ({max_size} bytes). Skipping.",
+      "decode_error": "Format Check: Decoding error on {file_name}: {exc}. Skipping auto-formatting to prevent data corruption.",
+      "generic_error": "Error checking markdown formatting on {file_name}: {exc}",
+      "json_read_error": "Error reading JSON file {file_name}: {exc}",
+      "cleaned_success": "Repository Hygiene (§13): Cleaned {count} trailing spaces and normalized EOF in {file_name}.",
+      "clean_success": "Markdown format clean: {file_name}",
+      "json_valid": "JSON syntax valid: {file_name}"
+    }
+  },
+  "auto_lint": {
+    "enabled": true,
+    "linter_binary": "ruff",
+    "linter_args": [
+      "check",
+      "--fix"
+    ],
+    "supported_extensions": [
+      ".py",
+      ".pyi"
+    ],
+    "max_file_size_bytes": 5242880,
+    "timeout_seconds": 15,
+    "monitored_tools": [
+      "write_to_file",
+      "replace_file_content",
+      "multi_replace_file_content"
+    ],
+    "target_argument_keys": [
+      "TargetFile",
+      "target_file",
+      "filePath",
+      "file_path",
+      "path"
+    ],
+    "block_windows_device_names": true,
+    "block_system_directories": true,
+    "respect_workspace_boundary": true,
+    "messages": {
+      "trigger_lint": "Triggering auto-lint for: {target_path}",
+      "lint_clean": "Auto-lint clean: {file_name}",
+      "lint_issues": "Auto-lint reported issues (code {returncode}) on {file_name}",
+      "linter_not_found": "Ruff executable not found in PATH; skipping auto-lint.",
+      "timeout": "Ruff linting timed out for {file_name}",
+      "file_too_large": "Skipping auto-lint for {file_name}: file size ({file_size} bytes) exceeds limit ({max_size} bytes)",
+      "unsafe_path": "Blocked auto-lint on unsafe/restricted path: {target_path}",
+      "exec_error": "Error during auto-lint execution: {exc}"
+    }
+  },
+  "dangerous_commands": {
+    "enabled": true,
+    "git_hygiene": {
+      "enabled": true,
+      "decision": "deny",
+      "reason_template": "Enterprise Git Hygiene Violation (§11): Prohibited '{description}'. You MUST run 'git status' first to inspect modified files and add specific files explicitly.",
+      "patterns": [
+        {
+          "pattern": "\\bgit(?:\\.exe)?\\s+(?:-[^\\s]+\\s+|--[^\\s]+\\s+)*add\\s+(?:-[^\\s]+\\s+|--[^\\s]+\\s+)*(?:\\.|\\./|\\*|\\-A|\\-\\-(?:all|update)|\\-u|:/|[\"'](?:\\.|\\./|\\*|:/)[\"'])(\\s+|$)",
+          "description": "Blanket git add staging (git add ., *, -A, --all)"
+        }
+      ]
+    },
+    "os_destruction": {
+      "enabled": true,
+      "decision": "force_ask",
+      "reason_template": "Destructive Operation Guard (Accidental Data Loss Prevention, §3): Detected dangerous pattern '{description}'. Execution requires explicit user confirmation.",
+      "patterns": [
+        {
+          "pattern": "\\brm(?:\\.exe)?\\s+(?:-[^\\s]+\\s+|--[^\\s]+\\s+)*(?:-[a-zA-Z0-9]*[rR][a-zA-Z0-9]*|--recursive)\\b(?:\\s+-[^\\s]+|\\s+--[^\\s]+)*\\s+[\"']?(?:/|/\\*|\\*|~|[a-zA-Z]:(?:\\\\|/)?|[a-zA-Z]:/\\*|\\.\\.|\\.|\\./)[\"']?(?=\\s|$)",
+          "description": "Recursive directory deletion of critical path"
+        },
+        {
+          "pattern": "\\brm(?:\\.exe)?\\s+(?:-[^\\s]+\\s+|--[^\\s]+\\s+)*[\"']?(?:/|/\\*|\\*|~|[a-zA-Z]:(?:\\\\|/)?|[a-zA-Z]:/\\*|\\.\\.|\\.|\\./)[\"']?(?:\\s+-[^\\s]+|\\s+--[^\\s]+)*(?:\\s+-[a-zA-Z0-9]*[rR][a-zA-Z0-9]*|\\s+--recursive)\\b",
+          "description": "Recursive directory deletion of critical path"
+        },
+        {
+          "pattern": "\\b(?:rmdir|rd)(?:\\.exe)?\\s+(?:/[a-zA-Z0-9]+\\s+)*(?:/[sS]\\s+/[qQ]|/[qQ]\\s+/[sS])\\s+[\"']?(?:[a-zA-Z]:(?:\\\\|/)?|\\\\|/|\\*|\\.\\.)[\"']?",
+          "description": "Windows destructive directory wipe (rmdir/rd)"
+        },
+        {
+          "pattern": "\\b(?:rmdir|rd)(?:\\.exe)?\\s+[\"']?(?:[a-zA-Z]:(?:\\\\|/)?|\\\\|/|\\*|\\.\\.)[\"']?\\s+(?:/[a-zA-Z0-9]+\\s+)*(?:/[sS]\\s+/[qQ]|/[qQ]\\s+/[sS])",
+          "description": "Windows destructive directory wipe (rmdir/rd)"
+        },
+        {
+          "pattern": "\\b(?:rmdir|rd)(?:\\.exe)?\\s+(?:/[a-zA-Z0-9]+\\s+)*(?:/[sS])\\b",
+          "description": "Windows recursive directory wipe (rmdir/rd)"
+        },
+        {
+          "pattern": "\\b(?:del|erase)(?:\\.exe)?\\s+(?:/[a-zA-Z0-9]+\\s+)*(?:/[fFsSqQ])\\s+.*[\"']?(?:[a-zA-Z]:(?:\\\\|/|\\*)?|\\*|\\.\\.|/|\\\\)[\"']?",
+          "description": "Windows silent forced disk/directory wipe (del/erase)"
+        },
+        {
+          "pattern": "\\b(?:del|erase)(?:\\.exe)?\\s+[\"']?(?:[a-zA-Z]:(?:\\\\|/|\\*)?|\\*|\\.\\.|/|\\\\)[\"']?\\s+(?:/[a-zA-Z0-9]+\\s+)*(?:/[fFsSqQ])",
+          "description": "Windows silent forced disk/directory wipe (del/erase)"
+        },
+        {
+          "pattern": "\\b(?:Remove-Item|ri)\\b(?=.*(?:-[a-zA-Z0-9]*r[a-zA-Z0-9]*|-recurse\\b))(?=.*(?:-[a-zA-Z0-9]*f[a-zA-Z0-9]*|-force\\b)).*[\"']?(?:[a-zA-Z]:(?:\\\\|/|\\*)?|\\\\|/|\\*|\\.\\.)[\"']?",
+          "description": "PowerShell destructive recursive deletion (Remove-Item)"
+        },
+        {
+          "pattern": "\\b(?:Remove-Item|ri)\\b(?=.*(?:-[a-zA-Z0-9]*r[a-zA-Z0-9]*|-recurse\\b)).*[\"']?(?:[a-zA-Z]:(?:\\\\|/|\\*)?|\\\\|/|\\*|\\.\\.)[\"']?",
+          "description": "PowerShell recursive directory wipe (Remove-Item)"
+        },
+        {
+          "pattern": "\\bformat(?:\\.exe)?\\s+(?:/[a-zA-Z0-9:]+\\s+)*[\"']?[a-zA-Z]:",
+          "description": "Disk formatting command"
+        },
+        {
+          "pattern": "\\bdiskpart(?:\\.exe)?\\b",
+          "description": "Disk partition utility invocation"
+        },
+        {
+          "pattern": "\\bmkfs(?:\\.[a-z0-9]+)?\\b",
+          "description": "Filesystem creation/format utility"
+        },
+        {
+          "pattern": "\\bdd\\b.*?\\bof=(?:/dev/|\\\\\\\\\\.?\\\\[a-zA-Z]:)",
+          "description": "Raw block device write via dd"
+        },
+        {
+          "pattern": ":\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:\\s*&\\s*\\}\\s*;\\s*:",
+          "description": "Fork bomb script pattern"
+        },
+        {
+          "pattern": "\\bchmod\\b(?=.*(?:-[a-zA-Z0-9]*[rR][a-zA-Z0-9]*|--recursive))(?=.*\\b777\\b).*?\\s+(?:/|/\\*|\\*|~)(?:\\s|$)",
+          "description": "Unsafe global filesystem permission rewrite"
+        },
+        {
+          "pattern": "\\bchown\\b(?=.*(?:-[a-zA-Z0-9]*[rR][a-zA-Z0-9]*|--recursive)).*?\\s+(?:/|/\\*|\\*|~)(?:\\s|$)",
+          "description": "Unsafe global root filesystem ownership rewrite"
+        }
+      ]
+    },
+    "db_destruction": {
+      "enabled": true,
+      "decision": "force_ask",
+      "reason_template": "Destructive Database Guard (Accidental Data Loss Prevention, §3): Detected dangerous pattern '{description}'. Execution requires explicit user confirmation.",
+      "patterns": [
+        {
+          "pattern": "\\bDROP\\s+DATABASE\\b",
+          "description": "DROP DATABASE command"
+        },
+        {
+          "pattern": "\\bDROP\\s+SCHEMA\\b",
+          "description": "DROP SCHEMA command"
+        },
+        {
+          "pattern": "\\bDROP\\s+TABLE\\b",
+          "description": "DROP TABLE command"
+        },
+        {
+          "pattern": "\\bTRUNCATE(?:\\s+TABLE)?\\b",
+          "description": "TRUNCATE TABLE command"
+        },
+        {
+          "pattern": "\\bDELETE\\s+FROM\\s+(?:[a-zA-Z0-9_.]+|[\"\\[`][^\"\\]`]+[\"\\]`])\\s*(?:;|$|WHERE\\s+(?:1\\s*=\\s*1|true|1|'1'\\s*=\\s*'1'|'a'\\s*=\\s*'a')\\b)",
+          "description": "Unbounded table deletion without WHERE clause"
+        },
+        {
+          "pattern": "\\bDROP\\s+EXTENSION\\b",
+          "description": "DROP EXTENSION command"
+        }
+      ]
+    },
+    "cloud_destruction": {
+      "enabled": true,
+      "decision": "force_ask",
+      "reason_template": "Destructive Operation Guard (Accidental Data Loss Prevention, §3): Detected dangerous pattern '{description}'. Execution requires explicit user confirmation.",
+      "patterns": [
+        {
+          "pattern": "\\bgcloud\\s+projects\\s+delete\\b",
+          "description": "GCloud project deletion"
+        },
+        {
+          "pattern": "\\bgsutil\\s+rm\\s+-[rR]+\\s+gs://",
+          "description": "Broad Cloud Storage bucket wipe"
+        },
+        {
+          "pattern": "\\bgcloud\\s+storage\\s+rm\\b.*?(?:-[a-zA-Z0-9]*r|--recursive)\\s+gs://",
+          "description": "Broad Cloud Storage bucket wipe"
+        },
+        {
+          "pattern": "\\baws\\s+s3\\s+(?:rm|rb)\\s+s3://.*?(?:--recursive|--force)",
+          "description": "AWS S3 broad bucket or object wipe"
+        },
+        {
+          "pattern": "\\baz\\s+group\\s+delete\\b",
+          "description": "Azure resource group deletion"
+        }
+      ]
+    }
+  },
+  "diff_security": {
+    "enabled": true,
+    "protected_tables": [
+      "users",
+      "accounts",
+      "orders",
+      "contracts",
+      "invoices",
+      "tenants",
+      "residents"
+    ],
+    "protected_models": [
+      "User",
+      "Account",
+      "Order",
+      "Contract",
+      "Invoice",
+      "Tenant",
+      "Resident"
+    ],
+    "tenant_id_fields": [
+      "tenant_id",
+      "organization_id",
+      "project_id",
+      "ownership_id",
+      "account_id",
+      "property_id",
+      "user_id"
+    ],
+    "protected_route_prefixes": [
+      "/api/v1/protected",
+      "/admin",
+      "/api/v1/billing"
+    ],
+    "allowed_secret_substrings": [
+      "your_secret",
+      "your-secret",
+      "your_api_key",
+      "my_secret",
+      "test_secret",
+      "placeholder_key",
+      "dummy_token",
+      "<your_",
+      "${env:",
+      "process.env",
+      "os.environ",
+      "settings.",
+      "config."
+    ],
+    "block_on_critical": true,
+    "git_diff_timeout_seconds": 10
+  }
+}

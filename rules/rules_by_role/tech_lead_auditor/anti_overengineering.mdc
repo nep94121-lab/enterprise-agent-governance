@@ -1,0 +1,11 @@
+---
+description: Anti-Over-Engineering & Minimal Change Invariant for AI Subagents
+globs: ["**/*"]
+alwaysApply: true
+---
+# ⚡ ANTI-OVER-ENGINEERING & MINIMAL CHANGE PROTOCOL
+
+1. **Nguyên Tắc Can Thiệp Tối Thiểu (Minimal Change):** Chỉ sửa đúng các dòng mã liên quan trực tiếp đến task được giao trong Task Contract (DISPATCH.md).
+2. **Cấm Refactor Ngoài Phạm Vi:** Tuyệt đối cấm tự ý xóa bỏ comments cũ, đổi tên biến tùy tiện, hoặc cấu trúc lại toàn bộ file nếu không có yêu cầu rõ ràng.
+3. **Chống Phức Tạp Hóa Giải Pháp:** Không tự ý đưa vào các mẫu thiết kế phức tạp (Factory, Strategy, Event Bus) khi một hàm đơn giản hoặc một module tiêu chuẩn đã đáp ứng đủ nghiệp vụ.
+4. **Bảo Toàn Ranh Giới Độc Quyền:** Tuyệt đối không chạm vào bất kỳ file nào nằm ngoài danh mục được cấp phép trong Bảng Exclusive File Ownership.
