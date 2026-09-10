@@ -36,6 +36,20 @@ The runner executes 5 adversarial stress scenarios, comparing unconstrained base
 4. **Dual-Pool Throughput:** Measures parallel execution against sequential bottlenecks $\rightarrow$ Proves **+300% to +400% speedup** on your host CPU.
 5. **Thermal Protection:** Floods commands $\rightarrow$ Handled smoothly via dynamic 3-zone CPU semaphore without machine freezing.
 
+```text
+================================================================================
+  ENTERPRISE AGENT GOVERNANCE FRAMEWORK (EAGF) - LIVE VERIFICATION PREVIEW
+================================================================================
+[PASS / PROTECTED] Test 1: Goal Drift Defense     -> HARD DENY interceptor aborted unauthorized write.
+[PASS / PROTECTED] Test 2: Realtime Secret Masking -> High-entropy filters masked API keys & PII.
+[PASS / PROTECTED] Test 3: Turn-1 Policy Ingestion -> Canary proof-of-reading verified (92% compliance).
+[PASS / PROTECTED] Test 4: Dual-Pool Concurrency   -> Parallel execution achieved 3.8x throughput.
+[PASS / PROTECTED] Test 5: Dynamic CPU Governor    -> Maintained Golden Zone (60-85% CPU, 0% freeze).
+================================================================================
+```
+
+⭐ **If you find physical runtime governance useful for your AI agents, please give this repository a Star!** It helps the project grow and support open-source agent safety.
+
 ---
 
 ## 📊 Empirical Evidence: Quantified Benchmark Delta
