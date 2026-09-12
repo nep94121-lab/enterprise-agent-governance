@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.2.0] - 2026-09-12
+
+### 👥 Specialized Enterprise Developer Roles (9 New Specialized Subagents)
+- **Granular Dev Specialization:** Expanded the developer tier beyond general backend/frontend roles into 9 highly focused discipline roles, each with dedicated rulebooks, Turn-1 canary gates, and strict hierarchy protocols:
+  1. **API & Integration Specialist (`api_integration_specialist`):** RESTful Level 3, OpenAPI 3.1, Idempotency keys, rate limiting, payload validation (`API_RULES.md`, Canary: `§API-SPECIALIST`).
+  2. **Database & Persistence Architect (`database_architect`):** Schema design, 2-way reversible migrations, index optimization, ACID isolation, connection pooling (`DATABASE_RULES.md`, Canary: `§DATABASE-ARCHITECT`).
+  3. **UI/UX & Design System Specialist (`ui_ux_specialist`):** Atomic design tokens, WCAG 2.1 AA accessibility, Tailwind CSS components, responsive design (`UI_UX_RULES.md`, Canary: `§UI-UX-SPECIALIST`).
+  4. **Performance & Concurrency Specialist (`performance_engineer`):** Async event loop optimization, race-condition elimination, memory leak profiling, lock ordering (`PERFORMANCE_RULES.md`, Canary: `§PERFORMANCE-ENGINEER`).
+  5. **Security Red-Team & Penetration Tester (`security_tester`):** OWASP Top 10 fuzzing, injection payloads, secrets/PII detection, vulnerability PoC reports (`SECURITY_TESTER_RULES.md`, Canary: `§SECURITY-TESTER`).
+  6. **Refactoring & Software Architect (`refactoring_engineer`):** Clean Architecture, SOLID principles, technical debt elimination, behavior preservation (`REFACTORING_RULES.md`, Canary: `§REFACTORING-ENGINEER`).
+  7. **Test Automation & E2E Specialist (`test_automation`):** Playwright headless browser E2E, integration suites, zero dummy tests, chaos engineering (`TEST_AUTOMATION_RULES.md`, Canary: `§TEST-AUTOMATION-SPECIALIST`).
+  8. **Cloud Infrastructure & SRE Specialist (`cloud_infra_engineer`):** Docker multi-stage builds, non-root containers, GitHub Actions CI/CD, compose manifests (`CLOUD_INFRA_RULES.md`, Canary: `§CLOUD-INFRA-ENGINEER`).
+  9. **Documentation Architect & Technical Writer (`documentation_architect`):** Architecture Decision Records (ADR), OpenAPI docs, Mermaid diagrams, tested runbooks (`DOCS_RULES.md`, Canary: `§DOCS-ARCHITECT`).
+- **Directory Guide (`DIRECTORY_ROLES.md`):** Complete enterprise developer roles catalog, boundary context, and responsibilities matrix.
+
+---
+
 ## [2.1.0] - 2026-09-12
 
 ### ⚡ Programming Safety Relays & Circuit Breakers (Zero-Crash Assurance)

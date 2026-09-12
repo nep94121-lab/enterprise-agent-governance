@@ -140,3 +140,12 @@
 | **Tier 3** | **Tech Lead Auditor** | `~/.gemini/config/enterprise-hooks/rules_by_role/tech_lead_auditor/TECH_LEAD_RULES.md` |
 | **Tier 3** | **DevOps & Security** | `~/.gemini/config/enterprise-hooks/rules_by_role/devops_security/DEVOPS_RULES.md` |
 | **Tier 3** | **Codebase Explorer** | `~/.gemini/config/enterprise-hooks/rules_by_role/codebase_explorer/EXPLORER_RULES.md` |
+| **Tier 3** | **API & Integration Specialist** | `~/.gemini/config/enterprise-hooks/rules_by_role/api_integration_specialist/API_RULES.md` |
+| **Tier 3** | **Database Architect** | `~/.gemini/config/enterprise-hooks/rules_by_role/database_architect/DATABASE_RULES.md` |
+| **Tier 3** | **UI/UX & Design System Specialist** | `~/.gemini/config/enterprise-hooks/rules_by_role/ui_ux_specialist/UI_UX_RULES.md` |
+| **Tier 3** | **Performance & Concurrency Specialist** | `~/.gemini/config/enterprise-hooks/rules_by_role/performance_engineer/PERFORMANCE_RULES.md` |
+| **Tier 3** | **Security Red-Team Tester** | `~/.gemini/config/enterprise-hooks/rules_by_role/security_tester/SECURITY_TESTER_RULES.md` |
+| **Tier 3** | **Refactoring & Software Architect** | `~/.gemini/config/enterprise-hooks/rules_by_role/refactoring_engineer/REFACTORING_RULES.md` |
+| **Tier 3** | **Test Automation & E2E Specialist** | `~/.gemini/config/enterprise-hooks/rules_by_role/test_automation/TEST_AUTOMATION_RULES.md` |
+| **Tier 3** | **Cloud Infrastructure & SRE Specialist** | `~/.gemini/config/enterprise-hooks/rules_by_role/cloud_infra_engineer/CLOUD_INFRA_RULES.md` |
+| **Tier 3** | **Documentation Architect** | `~/.gemini/config/enterprise-hooks/rules_by_role/documentation_architect/DOCS_RULES.md` |
