@@ -19,7 +19,7 @@ def run_tests():
         test_bin = Path(tmpdir) / "dummy.exe"
         test_bin.write_bytes(b"A" * 1000)
         registry.register_tool("sample_tool", "1.0.0", installed_path=test_bin)
-
+        
         saved_tool = registry.get_tool("sample_tool")
         initial_path = saved_tool.installed_path
         initial_checksum = saved_tool.checksum
@@ -36,7 +36,7 @@ def run_tests():
         # TEST 3: Không ghi đè vết lịch sử khi vừa bump version vừa đổi checksum
         test_bin.write_bytes(b"B" * 2000) # Thay đổi tệp nhị phân
         registry.register_tool("sample_tool", "1.1.0") # Vừa bump version vừa checksum mismatch
-
+        
         changes = registry.get_changes_for_tool("sample_tool")
         change_types = [c.change_type for c in changes]
         assert "version_bump" in change_types, "Lỗi: version_bump bị ghi đè mất dấu!"

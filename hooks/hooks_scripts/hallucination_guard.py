@@ -143,13 +143,13 @@ def load_guard_config() -> dict[str, Any]:
 
 
 def clean_raw_path(raw_path: str) -> str:
-    """Strip quotes, leading/trailing whitespace, and normalize slashes."""
+    """Strip quotes, leading/trailing whitespace, backticks, and normalize slashes."""
     if not isinstance(raw_path, str):
         return ""
     cleaned = raw_path.strip()
     if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
         cleaned = cleaned[1:-1].strip()
-    return cleaned
+    return cleaned.replace("`", "")
 
 
 def is_virtual_scheme(path_str: str, allowed_schemes: list[str]) -> bool:
@@ -178,24 +178,30 @@ def resolve_candidate_path(raw_path: str, workspace_roots: list[pathlib.Path]) -
         try:
             resolved = path_obj.resolve()
             return resolved, resolved.exists()
-        except (OSError, ValueError):
+        except (OSError, RuntimeError):
             return path_obj, False
 
-    # 2. Relative path: check against each workspace root
-    for root in workspace_roots:
-        try:
-            candidate = (root / path_obj).resolve()
-            if candidate.exists():
-                return candidate, True
-        except (OSError, ValueError):
-            continue
+    # 2. Search workspace roots
+    if workspace_roots:
+        for root in workspace_roots:
+            try:
+                candidate = (root / cleaned).resolve()
+                if candidate.exists():
+                    return candidate, True
+            except (OSError, RuntimeError):
+                continue
 
-    # 3. Fallback: relative to primary workspace root or cwd
-    primary_root = workspace_roots[0] if workspace_roots else pathlib.Path.cwd().resolve()
+        # Fallback anchor to primary workspace root
+        try:
+            return (workspace_roots[0] / cleaned).resolve(), False
+        except (OSError, RuntimeError):
+            return path_obj, False
+
+    # 3. Fallback to CWD
     try:
-        resolved = (primary_root / path_obj).resolve()
-        return resolved, resolved.exists()
-    except (OSError, ValueError):
+        resolved_cwd = (pathlib.Path.cwd() / cleaned).resolve()
+        return resolved_cwd, resolved_cwd.exists()
+    except (OSError, RuntimeError):
         return path_obj, False
 
 
@@ -245,7 +251,7 @@ def find_similar_files(
 
 
 def extract_script_from_command(command_str: str) -> str | None:
-    """Extract local script file target from command line strings (e.g. python script.py, node app.js)."""
+    """Extract local script file target from command line strings (e.g. python script.py, node app.js, powershell script.ps1)."""
     if not command_str or not isinstance(command_str, str):
         return None
 
@@ -253,31 +259,58 @@ def extract_script_from_command(command_str: str) -> str | None:
     if not cmd_stripped:
         return None
 
+    # Check decoded base64 payloads first
+    try:
+        from hook_utils.powershell_normalizer import extract_base64_payloads
+        for p in extract_base64_payloads(cmd_stripped):
+            res = extract_script_from_command(p)
+            if res:
+                return res
+    except ImportError:
+        pass
+
     # Handle pipeline or chained commands by taking each segment
     segments = re.split(r"[;&|]+", cmd_stripped)
     for seg in segments:
-        tokens = seg.strip().split()
+        seg_clean = seg.strip()
+        # Strip call operator & if present at start
+        if seg_clean.startswith("&"):
+            seg_clean = seg_clean[1:].strip()
+
+        tokens = seg_clean.split()
         if not tokens:
             continue
 
-        runner = pathlib.Path(tokens[0]).name.lower()
-        if runner in ("python", "python3", "py", "node", "ts-node", "bash", "sh", "pytest"):
+        raw_runner = clean_raw_path(tokens[0])
+        runner = pathlib.Path(raw_runner).name.lower()
+        if runner.endswith(".exe"):
+            runner = runner[:-4]
+
+        if runner in ("python", "python3", "py", "node", "ts-node", "bash", "sh", "pytest", "powershell", "pwsh"):
             # Scan subsequent tokens for a script argument
             idx = 1
             while idx < len(tokens):
-                tok = tokens[idx]
-                if tok in ("-m", "-c", "-e", "--eval", "-r", "--require"):
+                tok = clean_raw_path(tokens[idx])
+                if tok.lower() in ("-m", "-c", "-command", "-e", "--eval", "-r", "--require", "-encodedcommand", "-enc", "-ec"):
                     # Module execution or inline code, not a file target
                     break
-                if tok.startswith("-"):
+                if tok.startswith("-") and tok.lower() not in ("-f", "-file"):
                     idx += 1
                     continue
+                if tok.lower() in ("-f", "-file") and idx + 1 < len(tokens):
+                    tok = clean_raw_path(tokens[idx + 1])
+                    idx += 1
                 # Potential script path
                 clean_tok = clean_raw_path(tok)
                 ext = pathlib.Path(clean_tok).suffix.lower()
                 if ext in (".py", ".js", ".ts", ".sh", ".ps1", ".bash", ".rb", ".php"):
                     return clean_tok
                 break
+        else:
+            clean_first = clean_raw_path(raw_runner)
+            ext = pathlib.Path(clean_first).suffix.lower()
+            if ext in (".py", ".js", ".ts", ".sh", ".ps1", ".bash", ".rb", ".php"):
+                return clean_first
 
     return None
 

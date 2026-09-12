@@ -14,11 +14,11 @@ class ScannerConfig:
 class TranscriptScanner:
     def __init__(self, config=None):
         self.config = config or ScannerConfig()
-
+        
     def _check_context_overload(self, content, idx, report):
         if len(content) > self.config.max_context_size:
              report["context_overload"].append({"line": idx, "size": len(content)})
-
+             
     def _check_loops(self, tool_calls, idx, report, tool_counts, last_tool):
         if tool_calls:
             current_tools = [t.get("name") for t in tool_calls]
@@ -29,11 +29,11 @@ class TranscriptScanner:
             else:
                 last_tool[0] = current_tools
                 tool_counts.clear()
-
+                
     def _check_wandering(self, content, tool_calls, idx, report):
         if "view_file" in str(tool_calls) and "Desktop" in content and "hooks_scripts" not in content:
              report["wandering"].append({"line": idx, "detail": "Potentially exploring out of scope files."})
-
+             
     def _check_hook_bypasses(self, content, idx, report):
         if "cmd /c" in content and "pre_tool_use" not in content.lower():
              report["hook_bypasses"].append({"line": idx, "detail": "Direct command execution without obvious hook references."})
@@ -41,7 +41,7 @@ class TranscriptScanner:
     def _check_token_spikes(self, entry, idx, report):
         if "token_count" in entry and entry.get("token_count", 0) > self.config.max_token_count:
             report["token_spikes"].append({"line": idx, "tokens": entry["token_count"]})
-
+            
     def _check_low_effort(self, content, tool_calls, idx, report):
         if "completed" in content.lower() and len(tool_calls) == 0 and len(content) < self.config.low_effort_length:
             report["low_effort"].append({"line": idx, "content": content})
@@ -55,7 +55,7 @@ class TranscriptScanner:
             "token_spikes": [],
             "low_effort": []
         }
-
+        
         if not log_file.exists():
             return report
 
@@ -76,17 +76,17 @@ class TranscriptScanner:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
+                
             content = str(entry.get("content", ""))
             tool_calls = entry.get("tool_calls", [])
             if tool_calls:
                 total_tool_calls += len(tool_calls)
-
+                
             if not agent_role and "role" in content:
                 m = re.search(r"role:\s*([^\n\r]+)", content)
                 if m:
                     agent_role = m.group(1).strip()
-
+            
             self._check_context_overload(content, idx, report)
             self._check_loops(tool_calls, idx, report, tool_counts, last_tool)
             self._check_wandering(content, tool_calls, idx, report)
@@ -103,14 +103,14 @@ class TranscriptScanner:
 def generate_markdown_report(all_reports: dict, output_file: Path):
     with output_file.open("w", encoding="utf-8") as f:
         f.write("# Watchdog Deep Inspector Report\n\n")
-
+        
         for file_path, report_data in all_reports.items():
             agent_name = report_data.get("agent_name", Path(file_path).parent.parent.name)
             f.write(f"## Subagent / Transcript: `{agent_name}`\n")
             f.write(f"- **Log Path:** `{file_path}`\n")
             f.write(f"- **Total Tool Calls:** {report_data.get('total_tool_calls', 0)}\n")
             f.write(f"- **Max Tool Repetition:** {report_data.get('max_repeat', 0)}\n\n")
-
+            
             f.write("### 1. Context Overload (Nguy cơ tràn ngữ cảnh)\n")
             overloads = report_data.get("context_overload", [])
             if overloads:
@@ -118,7 +118,7 @@ def generate_markdown_report(all_reports: dict, output_file: Path):
                     f.write(f"- ⚠️ Line {item['line']}: Kích thước nội dung {item['size']:,} bytes\n")
             else:
                 f.write("- ✅ Không phát hiện tràn ngữ cảnh.\n")
-
+                
             f.write("\n### 2. Loops / Lặp Vô Tận (KILL Candidates)\n")
             loops = report_data.get("loops", [])
             if loops:
@@ -126,7 +126,7 @@ def generate_markdown_report(all_reports: dict, output_file: Path):
                     f.write(f"- 🚨 Line {item['line']}: Lặp công cụ liên tiếp: `{item['tools']}`\n")
             else:
                 f.write("- ✅ Không phát hiện lặp công cụ bất thường.\n")
-
+                
             f.write("\n### 3. Wandering (Làm ngoài phạm vi / Làm linh tinh)\n")
             wanders = report_data.get("wandering", [])
             if wanders:
@@ -134,7 +134,7 @@ def generate_markdown_report(all_reports: dict, output_file: Path):
                     f.write(f"- ⚠️ Line {item['line']}: {item['detail']}\n")
             else:
                 f.write("- ✅ Tập trung đúng phạm vi công việc.\n")
-
+                
             f.write("\n### 4. Hook Bypasses (Vượt rào kiểm soát)\n")
             bypasses = report_data.get("hook_bypasses", [])
             if bypasses:
@@ -142,7 +142,7 @@ def generate_markdown_report(all_reports: dict, output_file: Path):
                     f.write(f"- ⚠️ Line {item['line']}: {item['detail']}\n")
             else:
                 f.write("- ✅ 100% tuân thủ rào chắn Hooks.\n")
-
+                
             f.write("\n### 5. Token Spikes (Đột biến Token)\n")
             spikes = report_data.get("token_spikes", [])
             if spikes:
@@ -150,7 +150,7 @@ def generate_markdown_report(all_reports: dict, output_file: Path):
                     f.write(f"- ⚠️ Line {item['line']}: Tiêu thụ {item['tokens']} tokens\n")
             else:
                 f.write("- ✅ Mức tiêu thụ token ổn định.\n")
-
+                
             f.write("\n### 6. Low Effort (Làm cho có / Thiếu kiểm chứng)\n")
             lows = report_data.get("low_effort", [])
             if lows:
@@ -176,26 +176,27 @@ if __name__ == "__main__":
     parser.add_argument("--session-dir", type=str, required=False, help="Brain session directory (scans all subagent transcripts inside)")
     parser.add_argument("--output", type=str, default="watchdog_report.md", help="Output report file (.md)")
     args = parser.parse_args()
-
+    
     scanner = TranscriptScanner()
     all_reports = {}
-
+    
     if args.session_dir:
         s_dir = Path(args.session_dir)
         if s_dir.exists():
             for log_file in s_dir.rglob("transcript.jsonl"):
                 all_reports[str(log_file)] = scanner.scan_transcript(log_file)
-
+                
     if args.logs_dir:
         l_dir = Path(args.logs_dir)
         all_reports.update(scan_target(l_dir, scanner))
-
+        
     if args.transcript:
         for t_file in args.transcript:
             p = Path(t_file)
             if p.exists():
                 all_reports.update(scan_target(p, scanner))
-
+                
     out_file = Path(args.output)
     generate_markdown_report(all_reports, out_file)
     print(f"[Watchdog] Successfully generated telemetry report for {len(all_reports)} transcripts at: {out_file.absolute()}")
+

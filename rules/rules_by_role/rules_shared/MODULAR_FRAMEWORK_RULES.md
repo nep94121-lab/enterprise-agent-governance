@@ -1,6 +1,6 @@
 # 📦 MODULAR FRAMEWORK RULES: 10 CHUẨN CÔNG NGHỆ CHUYÊN BIỆT CHO WORKER SUBAGENTS
-**Phiên bản**: 2.0 (Enterprise Modular Standard)
-**Phân loại**: Framework Specific Best-Practices
+**Phiên bản**: 2.0 (Enterprise Modular Standard)  
+**Phân loại**: Framework Specific Best-Practices  
 **Mục tiêu**: Cung cấp bộ quy tắc tinh gọn, chính xác theo từng ngôn ngữ/khung làm việc, giúp Worker Sub-agents chỉ nạp đúng module cần thiết, tiết kiệm 38.5% Context Token.
 
 ---

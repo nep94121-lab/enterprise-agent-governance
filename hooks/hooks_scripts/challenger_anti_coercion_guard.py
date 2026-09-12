@@ -8,7 +8,7 @@ Enforces:
 2. Anti-Slop Quantitative Scale:
    Enforces minimum codebase size (>= 800 LoC total, >= 100 LoC per service), rejects 0-byte test files.
 3. 8-Thread Hardware Saturation Proof:
-   Requires multi-process test harness to utilize all DYNAMIC_THREAD_COUNT of the Windows 11 host (4C/8T).
+   Requires multi-process test harness to utilize all 8 threads of the Windows 11 host (4C/8T).
 """
 
 import os
@@ -37,7 +37,7 @@ def check_prompt_coercion(prompt_text: str) -> tuple[bool, str]:
     """
     if not prompt_text:
         return True, "Empty prompt"
-
+    
     text_lower = prompt_text.lower()
     for pattern in COERCION_PHRASES:
         if re.search(pattern, text_lower):
@@ -55,7 +55,7 @@ def audit_codebase_scale(services_dir: str) -> tuple[bool, int, list[str]]:
     total_loc = 0
     issues = []
     service_dirs = [d for d in os.listdir(services_dir) if os.path.isdir(os.path.join(services_dir, d))]
-
+    
     if len(service_dirs) < 4:
         issues.append(f"Insufficient services found: {len(service_dirs)} (expected at least 4-6).")
 
@@ -65,7 +65,7 @@ def audit_codebase_scale(services_dir: str) -> tuple[bool, int, list[str]]:
         if not os.path.exists(main_py):
             issues.append(f"Service '{sname}' is missing 'main.py'.")
             continue
-
+        
         try:
             with open(main_py, "r", encoding="utf-8", errors="ignore") as fp:
                 lines = [l.strip() for l in fp if l.strip() and not l.strip().startswith("#")]
@@ -90,7 +90,7 @@ def audit_test_files_scale(tests_dir: str) -> tuple[bool, list[str]]:
 
     issues = []
     test_files = [f for f in os.listdir(tests_dir) if f.startswith("test_") and f.endswith(".py")]
-
+    
     if not test_files:
         return False, ["No test files found in tests directory."]
 
@@ -105,35 +105,57 @@ def audit_test_files_scale(tests_dir: str) -> tuple[bool, list[str]]:
     return len(issues) == 0, issues
 
 def run_hook():
-    """Hook entry point"""
+    """Hook entry point with standard JSON output and anti-coercion validation."""
     try:
-        raw_input = sys.stdin.read()
-        if not raw_input.strip():
+        MAX_STDIN_BYTES = 10 * 1024 * 1024
+        raw_input = sys.stdin.read(MAX_STDIN_BYTES + 1)
+        if not raw_input or not raw_input.strip():
+            print(json.dumps({"decision": "ALLOW", "reason": "Empty payload"}, ensure_ascii=False))
             sys.exit(0)
+
+        if len(raw_input) > MAX_STDIN_BYTES:
+            deny_msg = f"❌ [DENY]: Payload exceeds maximum limit of {MAX_STDIN_BYTES} bytes."
+            print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+            sys.exit(0)
+
         data = json.loads(raw_input)
-    except Exception:
-        sys.exit(0)
+        if not isinstance(data, dict):
+            print(json.dumps({"decision": "ALLOW", "reason": "Non-object payload"}, ensure_ascii=False))
+            sys.exit(0)
 
-    # Check tool args for prompt coercion if invoking subagent
-    tool_name = data.get("tool_name", "")
-    tool_args = data.get("tool_args", {})
-    if tool_name == "invoke_subagent":
-        subagents = tool_args.get("Subagents", [])
-        if isinstance(subagents, str):
-            try:
-                subagents = json.loads(subagents)
-            except Exception:
+        tool_call = data.get("toolCall") if isinstance(data.get("toolCall"), dict) else {}
+        tool_name = data.get("tool_name") or tool_call.get("name") or ""
+        tool_args = data.get("tool_args") or tool_call.get("args") or data.get("arguments") or {}
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+
+        if tool_name == "invoke_subagent":
+            subagents = tool_args.get("Subagents", [])
+            if isinstance(subagents, str):
+                try:
+                    subagents = json.loads(subagents)
+                except Exception:
+                    subagents = []
+            if not isinstance(subagents, list):
                 subagents = []
-        for sa in subagents:
-            role = sa.get("Role", "") or sa.get("role", "")
-            prompt = sa.get("Prompt", "") or sa.get("prompt", "")
-            if "challenger" in role.lower() or "critique" in role.lower():
-                ok, msg = check_prompt_coercion(prompt)
-                if not ok:
-                    print(f"[CHALLENGER_ANTI_COERCION_GUARD] {msg}", file=sys.stderr)
-                    sys.exit(1)
+            for sa in subagents:
+                if not isinstance(sa, dict):
+                    continue
+                role = sa.get("Role", "") or sa.get("role", "") or ""
+                prompt = sa.get("Prompt", "") or sa.get("prompt", "") or ""
+                if "challenger" in str(role).lower() or "critique" in str(role).lower():
+                    ok, msg = check_prompt_coercion(prompt)
+                    if not ok:
+                        deny_msg = f"❌ [CHALLENGER ANTI-COERCION DENIED]: {msg}"
+                        print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+                        sys.exit(0)
 
-    sys.exit(0)
+        print(json.dumps({"decision": "ALLOW", "reason": "Challenger anti-coercion check passed"}, ensure_ascii=False))
+        sys.exit(0)
+    except Exception as exc:
+        deny_msg = f"❌ [CHALLENGER ANTI-COERCION FAIL-CLOSED]: {exc}"
+        print(json.dumps({"decision": "DENY", "reason": deny_msg}, ensure_ascii=False))
+        sys.exit(0)
 
 def self_test():
     print("=== RUNNING SELF-TEST: challenger_anti_coercion_guard.py ===")
@@ -175,7 +197,7 @@ def self_test():
     os.rmdir(mock_services)
 
     # Test 5: Real codebase scale check on actual workspace
-    workspace_services = str(pathlib.Path.cwd() / "services")
+    workspace_services = "C:\\Users\\Admin\\Desktop\\học tập\\services"
     if os.path.exists(workspace_services):
         ok, loc, issues = audit_codebase_scale(workspace_services)
         print(f"Test 5 Info: Current workspace services LoC: {loc} (Passed: {ok})")

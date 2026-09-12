@@ -16,7 +16,10 @@ import io
 import json
 import os
 import pathlib
+import random
 import sys
+import threading
+import time
 from typing import Any
 
 # Enforce UTF-8 standard encoding on Windows PowerShell
@@ -71,6 +74,125 @@ DEFAULT_TRAJECTORY_CONFIG: dict[str, Any] = {
     "state_storage_dir": ".trajectory_guard",
     "state_file_name": "trajectory_state.json",
 }
+
+
+class CrossProcessLock:
+    """Robust cross-process & cross-thread file lock supporting Windows (msvcrt) and POSIX (fcntl).
+
+    Combines in-process threading.RLock with kernel-level file locking (msvcrt/fcntl).
+    Supports reentrancy and prevents WinError 32 / WinError 5 file contention locks on Windows NTFS.
+    """
+
+    _process_locks: dict[str, threading.RLock] = {}
+    _lock_depths: dict[tuple[int, str], int] = {}
+    _lock_fds: dict[str, int] = {}
+    _meta_lock = threading.Lock()
+
+    def __init__(self, lock_file: pathlib.Path, timeout: float = 10.0):
+        self.lock_file = pathlib.Path(lock_file).resolve()
+        self.timeout = timeout
+        self.path_key = str(self.lock_file).lower() if sys.platform == "win32" else str(self.lock_file)
+        self._thread_key = (threading.get_ident(), self.path_key)
+
+    @classmethod
+    def _get_thread_lock(cls, key: str) -> threading.RLock:
+        with cls._meta_lock:
+            if key not in cls._process_locks:
+                cls._process_locks[key] = threading.RLock()
+            return cls._process_locks[key]
+
+    def __enter__(self) -> CrossProcessLock:
+        thread_lock = self._get_thread_lock(self.path_key)
+        start_time = time.monotonic()
+        acquired = thread_lock.acquire(timeout=self.timeout)
+        if not acquired:
+            raise TimeoutError(f"Timed out waiting for thread lock on: {self.lock_file}")
+
+        with CrossProcessLock._meta_lock:
+            depth = CrossProcessLock._lock_depths.get(self._thread_key, 0)
+            if depth > 0:
+                CrossProcessLock._lock_depths[self._thread_key] = depth + 1
+                return self
+
+        try:
+            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT)
+            os_start = time.monotonic()
+            while True:
+                try:
+                    if sys.platform == "win32":
+                        import msvcrt
+
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with CrossProcessLock._meta_lock:
+                        CrossProcessLock._lock_depths[self._thread_key] = 1
+                        CrossProcessLock._lock_fds[self.path_key] = fd
+                    return self
+                except OSError:
+                    if time.monotonic() - os_start > self.timeout:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                        raise TimeoutError(f"Timed out waiting for cross-process file lock: {self.lock_file}")
+                    time.sleep(0.005 + random.uniform(0.002, 0.008))
+        except Exception:
+            thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        thread_lock = self._get_thread_lock(self.path_key)
+        release_os = False
+        fd = None
+        with CrossProcessLock._meta_lock:
+            depth = CrossProcessLock._lock_depths.get(self._thread_key, 0)
+            if depth > 1:
+                CrossProcessLock._lock_depths[self._thread_key] = depth - 1
+            else:
+                CrossProcessLock._lock_depths.pop(self._thread_key, None)
+                fd = CrossProcessLock._lock_fds.pop(self.path_key, None)
+                release_os = True
+
+        if release_os and fd is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        thread_lock.release()
+
+
+def atomic_replace_file(src: pathlib.Path, dst: pathlib.Path, max_retries: int = 10) -> None:
+    """Safely replace dst with src using atomic rename and Windows retry backoff."""
+    for attempt in range(max_retries):
+        try:
+            src.replace(dst)
+            return
+        except (PermissionError, OSError):
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(0.01 * (1.5**attempt) + random.uniform(0.005, 0.015))
 
 
 IGNORED_ARG_KEYS: set[str] = {
@@ -372,32 +494,46 @@ def update_conversation_history(
     current_calls: list[dict[str, Any]],
     max_window: int = 20,
 ) -> list[dict[str, Any]]:
-    """Persist and accumulate tool calls across invocations for the conversation."""
+    """Persist and accumulate tool calls across invocations for the conversation under IPC lock (Mục 27, 28)."""
     safe_id = "".join(c for c in conv_id if c.isalnum() or c in ("-", "_")) or "default"
     state_file = state_dir / f"{safe_id}.json"
+    lock_file = state_dir / f"{safe_id}.lock"
 
-    history: list[dict[str, Any]] = []
-    if state_file.exists():
+    # Cross-process lock prevents concurrent subagent race conditions (Mục 27)
+    with CrossProcessLock(lock_file, timeout=10.0):
+        history: list[dict[str, Any]] = []
+        if state_file.exists():
+            try:
+                with open(state_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    history = data
+            except (json.JSONDecodeError, OSError) as exc:
+                log_diagnostic(f"Error reading trajectory state {state_file}: {exc}")
+                history = []
+
+        history.extend(current_calls)
+        if len(history) > max_window:
+            history = history[-max_window:]
+
+        # Unique temporary filename with PID + time_ns + entropy to prevent collisions (Mục 28)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = (
+            state_dir
+            / f"{safe_id}.tmp.{os.getpid()}.{time.time_ns()}.{random.randint(1000, 9999)}"
+        )
         try:
-            with open(state_file, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                history = data
-        except (json.JSONDecodeError, OSError):
-            history = []
-
-    history.extend(current_calls)
-    if len(history) > max_window:
-        history = history[-max_window:]
-
-    # Atomic write to avoid corruption during concurrent runs
-    tmp_file = state_dir / f"{safe_id}.tmp"
-    try:
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False)
-        tmp_file.replace(state_file)
-    except OSError as exc:
-        log_diagnostic(f"Failed to persist trajectory state for {conv_id}: {exc}")
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False)
+            atomic_replace_file(tmp_file, state_file)
+        except OSError as exc:
+            log_diagnostic(f"Failed to persist trajectory state for {conv_id}: {exc}")
+        finally:
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     return history
 

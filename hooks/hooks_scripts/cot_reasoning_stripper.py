@@ -52,6 +52,7 @@ for import_path in (str(HOOKS_SCRIPTS_DIR), str(ENTERPRISE_HOOKS_ROOT)):
 try:
     from common_hook_lib import (
         emit_stdout_json,
+        extract_tool_invocation,
         get_tool_args,
         get_tool_call,
         log_diagnostic,
@@ -62,6 +63,14 @@ try:
     HAS_COMMON_LIB = True
 except ImportError:
     HAS_COMMON_LIB = False
+
+    def extract_tool_invocation(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+        name = payload.get("tool_name") or tool_call.get("name") or payload.get("tool") or ""
+        args = payload.get("tool_args") or tool_call.get("args") or payload.get("arguments") or payload.get("kwargs") or {}
+        if not isinstance(args, dict):
+            args = {}
+        return str(name), args
 
     def log_diagnostic(msg: str) -> None:
         try:
@@ -74,8 +83,12 @@ except ImportError:
         if default is None:
             default = {}
         try:
-            raw = sys.stdin.read()
+            max_bytes = 10 * 1024 * 1024
+            raw = sys.stdin.read(max_bytes + 1)
             if not raw or not raw.strip():
+                return default
+            if len(raw) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw)} > {max_bytes} bytes).")
                 return default
             parsed = json.loads(raw)
             return parsed if isinstance(parsed, dict) else default
@@ -295,12 +308,10 @@ def process_file(file_path: pathlib.Path) -> bool:
 
 def run_hook(payload: dict[str, Any]) -> dict[str, Any]:
     """Execute PostToolUse inspection on written files."""
-    tool_call = get_tool_call(payload)
-    tool_name = tool_call.get("name", "")
+    tool_name, args = extract_tool_invocation(payload)
     if tool_name not in MONITORED_TOOLS:
         return post_tool_response()
 
-    args = get_tool_args(tool_call)
     raw_path = extract_target_path(args)
     if not raw_path:
         return post_tool_response()

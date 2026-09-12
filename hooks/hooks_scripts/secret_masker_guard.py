@@ -40,6 +40,7 @@ Core Mission:
 
 from __future__ import annotations
 
+import html
 import io
 import json
 import math
@@ -47,6 +48,8 @@ import pathlib
 import re
 import subprocess
 import sys
+import unicodedata
+import urllib.parse
 from typing import Any
 
 # Enforce UTF-8 standard encoding on Windows PowerShell
@@ -89,8 +92,14 @@ except ImportError:
         if default is None:
             default = {}
         try:
-            raw = sys.stdin.read()
-            return json.loads(raw) if raw and raw.strip() else default
+            max_bytes = 10 * 1024 * 1024
+            raw = sys.stdin.read(max_bytes + 1)
+            if not raw or not raw.strip():
+                return default
+            if len(raw) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw)} > {max_bytes} bytes).")
+                return default
+            return json.loads(raw)
         except Exception:
             return default
 
@@ -106,6 +115,121 @@ except ImportError:
 
     def post_tool_response() -> dict[str, Any]:
         return {}
+
+
+# ==============================================================================
+# CANONICALIZATION, HOMOGLYPHS & DEOBFUSCATION ENGINE
+# ==============================================================================
+
+# Invisible & Zero-Width characters pattern (fragmentation & boundary evasion)
+INVISIBLE_CHARS_REGEX = re.compile(
+    r"[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff\u00ad\u034f\u180e]"
+)
+
+# Homoglyphs translation mapping (Cyrillic & Greek confusables to Latin/ASCII)
+HOMOGLYPH_MAP: dict[str, str] = {
+    # Cyrillic lowercase
+    "\u0430": "a", "\u0432": "b", "\u0441": "c", "\u0434": "d",
+    "\u0435": "e", "\u0451": "e", "\u04bb": "h", "\u0456": "i",
+    "\u0457": "i", "\u0458": "j", "\u043a": "k", "\u043c": "m",
+    "\u043d": "n", "\u043e": "o", "\u0440": "p", "\u0442": "t",
+    "\u0443": "y", "\u0445": "x", "\u0455": "s",
+    # Cyrillic uppercase
+    "\u0410": "A", "\u0412": "B", "\u0421": "C", "\u0415": "E",
+    "\u0401": "E", "\u04ba": "H", "\u0406": "I", "\u0407": "I",
+    "\u0408": "J", "\u041a": "K", "\u041c": "M", "\u041d": "H",
+    "\u041e": "O", "\u0420": "P", "\u0422": "T", "\u0423": "Y",
+    "\u0425": "X", "\u0405": "S",
+    # Greek lowercase
+    "\u03b1": "a", "\u03b2": "b", "\u03b5": "e", "\u03b7": "h",
+    "\u03b9": "i", "\u03ba": "k", "\u03bc": "m", "\u03bd": "n",
+    "\u03bf": "o", "\u03c1": "p", "\u03c4": "t", "\u03c5": "u",
+    "\u03c7": "x",
+    # Greek uppercase
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0396": "Z",
+    "\u0397": "H", "\u0399": "I", "\u039a": "K", "\u039c": "M",
+    "\u039d": "N", "\u039f": "O", "\u03a1": "P", "\u03a4": "T",
+    "\u03a5": "Y", "\u03a7": "X",
+}
+HOMOGLYPH_TABLE = str.maketrans(HOMOGLYPH_MAP)
+
+
+def strip_invisible_chars(text: str) -> str:
+    """Remove zero-width, formatting, and invisible characters that fragment tokens."""
+    if not text:
+        return text
+    return INVISIBLE_CHARS_REGEX.sub("", text)
+
+
+def normalize_unicode_and_fullwidth(text: str) -> str:
+    """Normalize text using NFKC (full-width digits/letters to ASCII) and NFC (Vietnamese composition)."""
+    if not text:
+        return text
+    norm = unicodedata.normalize("NFKC", text)
+    norm = unicodedata.normalize("NFC", norm)
+    return norm
+
+
+def normalize_homoglyphs(text: str) -> str:
+    """Map Cyrillic and Greek homoglyphs to ASCII counterparts."""
+    if not text:
+        return text
+    return text.translate(HOMOGLYPH_TABLE)
+
+
+def decode_escapes(s: str) -> str:
+    r"""Safely decode Unicode and hex escapes (\uXXXX, \UXXXXXXXX, \xXX)."""
+    def _repl_u(m: re.Match[str]) -> str:
+        try:
+            val = int(m.group(1), 16)
+            if 0x20 <= val <= 0x7E or val >= 0xA0:
+                return chr(val)
+        except Exception:
+            pass
+        return m.group(0)
+
+    s = re.sub(r"(?i)(?:\\{1,2})u([0-9a-f]{4})", _repl_u, s)
+    s = re.sub(r"(?i)(?:\\{1,2})U([0-9a-f]{8})", _repl_u, s)
+    s = re.sub(r"(?i)(?:\\{1,2})x([0-9a-f]{2})", _repl_u, s)
+    return s
+
+
+def decode_multi_layer(text: str, max_passes: int = 4) -> str:
+    """Recursively decode HTML entities, Unicode/hex escapes, and URL percent-encoding."""
+    if not text:
+        return text
+    current = text
+    for _ in range(max_passes):
+        prev = current
+        try:
+            current = html.unescape(current)
+        except Exception:
+            pass
+        try:
+            current = decode_escapes(current)
+        except Exception:
+            pass
+        if "%" in current:
+            try:
+                unquoted = urllib.parse.unquote(current)
+                if unquoted != current:
+                    current = unquoted
+            except Exception:
+                pass
+        if current == prev:
+            break
+    return current
+
+
+def canonicalize_for_detection(text: str) -> str:
+    """Execute complete deobfuscation and normalization pipeline."""
+    if not text:
+        return text
+    s = decode_multi_layer(text)
+    s = strip_invisible_chars(s)
+    s = normalize_unicode_and_fullwidth(s)
+    s = normalize_homoglyphs(s)
+    return s
 
 
 # Regex Signatures for Known Cloud & Service Credentials
@@ -175,7 +299,16 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "DATABASE_URI_PASSWORD",
-        re.compile(r"(?i)((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql):\/\/[^\s:]+:)([^\s@]+)(@[^\s]+)"),
+        re.compile(
+            r"(?i)\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|mssql|mariadb|clickhouse):\/\/[^\s\/?#@:]+:)([^\s]*)(@[a-zA-Z0-9.\-_\[\]]+(?::\d+)?(?:\/[^\s\"\'\)]*)?)"
+        ),
+        r"\1********\3",
+    ),
+    (
+        "DATABASE_URI_PASSWORD_ENCODED_DELIMITER",
+        re.compile(
+            r"(?i)\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|mssql|mariadb|clickhouse):\/\/[^\s\/?#:]+:)([^\s]*)(%40[a-zA-Z0-9.\-_\[\]]+(?::\d+)?(?:\/[^\s\"\'\)]*)?)"
+        ),
         r"\1********\3",
     ),
     (
@@ -203,18 +336,24 @@ def calculate_shannon_entropy(data: str) -> float:
 
 def is_high_entropy_secret(token: str, min_length: int = 24, min_entropy: float = 4.5) -> bool:
     """Check if an alphanumeric token has unusually high Shannon entropy characteristic of keys."""
-    if len(token) < min_length:
+    if not token:
+        return False
+    clean_token = strip_invisible_chars(token)
+    clean_token = normalize_unicode_and_fullwidth(clean_token)
+    clean_token = normalize_homoglyphs(clean_token)
+
+    if len(clean_token) < min_length:
         return False
     # Avoid natural prose or repetitive symbols
-    if " " in token or "/" in token and not re.match(r"^[A-Za-z0-9+/=_-]+$", token):
+    if " " in clean_token or ("/" in clean_token and not re.match(r"^[A-Za-z0-9+/=_-]+$", clean_token)):
         return False
     # Exclude common base64 padding or monotonous strings
-    if len(set(token)) < 12:
+    if len(set(clean_token)) < 12:
         return False
     # Must look like an alphanumeric hash/token
-    if not re.match(r"^[A-Za-z0-9_\-+=]+$", token):
+    if not re.match(r"^[A-Za-z0-9_\-+=]+$", clean_token):
         return False
-    return calculate_shannon_entropy(token) >= min_entropy
+    return calculate_shannon_entropy(clean_token) >= min_entropy
 
 
 # ==============================================================================
@@ -296,7 +435,8 @@ def get_context_clause(content: str, start: int, end: int, max_dist: int = 60) -
         pos = content.find(d, end)
         if pos != -1 and pos < clause_end:
             clause_end = pos
-    return content[max(0, start - max_dist, clause_start):min(len(content), end + max_dist, clause_end)]
+    raw_clause = content[max(0, start - max_dist, clause_start):min(len(content), end + max_dist, clause_end)]
+    return normalize_unicode_and_fullwidth(raw_clause)
 
 
 def is_valid_vn_mst(val: str) -> bool:
@@ -452,16 +592,26 @@ def scan_and_mask_vietnam_pii(content: str) -> tuple[str, list[dict[str, Any]]]:
 def mask_all_secrets(content: str) -> tuple[str, list[dict[str, Any]]]:
     """Scan and redact known secret patterns, Vietnamese PII, and high-entropy credentials from text.
 
+    Applies full pre-processing:
+    - Multi-layer / Double decoding (HTML entity, Unicode/hex escapes, URL percent-encoding)
+    - Zero-width & invisible character defragmentation
+    - Unicode normalization (NFKC full-width to ASCII, NFC Vietnamese composition)
+    - Homoglyphs translation (Cyrillic & Greek to Latin/ASCII)
+    - High-precision Database URI parsing with URL-encoded passwords & delimiters
+
     Returns:
         (masked_content, detected_secrets_list)
     """
     if not content:
         return content, []
 
+    # Pre-process & canonicalize text
+    canonical = canonicalize_for_detection(content)
+
     detected_secrets: list[dict[str, Any]] = []
 
     # 1. Apply Vietnamese PII Detection & Smart Masking (Decree 13/2023/ND-CP)
-    sanitized, detected_pii = scan_and_mask_vietnam_pii(content)
+    sanitized, detected_pii = scan_and_mask_vietnam_pii(canonical)
     if detected_pii:
         detected_secrets.extend(detected_pii)
 
@@ -504,6 +654,10 @@ def mask_all_secrets(content: str) -> tuple[str, list[dict[str, Any]]]:
             masked_token = token_str[:4] + ("*" * (len(token_str) - 8)) + token_str[-4:]
             sanitized = sanitized[:match.start()] + masked_token + sanitized[match.end():]
 
+    # Clean text preservation: if no secrets detected, return original content untouched
+    if not detected_secrets:
+        return content, []
+
     return sanitized, detected_secrets
 
 
@@ -542,19 +696,48 @@ def evaluate_secret_masker(payload: dict[str, Any]) -> dict[str, Any]:
     total_secrets_found = 0
     patterns_found: list[str] = []
 
-    # Check tool arguments
-    if tool_args:
-        _, detected_in_args = mask_all_secrets(json.dumps(tool_args))
+    # Check tool arguments using recursive in-place inspection (avoids JSON serialization distortion)
+    if tool_args and isinstance(tool_args, dict):
+        _, detected_in_args = inspect_and_mask_tool_payload(tool_name, tool_args)
         if detected_in_args:
-            total_secrets_found += len(detected_in_args)
-            patterns_found.extend([d["pattern"] for d in detected_in_args])
+            total_secrets_found += detected_in_args
+
+            def extract_patterns(item: Any) -> None:
+                if isinstance(item, str):
+                    _, detected = mask_all_secrets(item)
+                    for d in detected:
+                        patterns_found.append(d["pattern"])
+                elif isinstance(item, dict):
+                    for v in item.values():
+                        extract_patterns(v)
+                elif isinstance(item, list):
+                    for v in item:
+                        extract_patterns(v)
+
+            extract_patterns(tool_args)
+
+        # Cross-boundary check with ensure_ascii=False
+        try:
+            raw_json = json.dumps(tool_args, ensure_ascii=False)
+            _, detected_json = mask_all_secrets(raw_json)
+            for d in detected_json:
+                if d["pattern"] not in patterns_found:
+                    patterns_found.append(d["pattern"])
+                    total_secrets_found += 1
+        except Exception:
+            pass
 
     # Check tool output
-    if tool_output and isinstance(tool_output, str):
-        _, detected_in_output = mask_all_secrets(tool_output)
-        if detected_in_output:
-            total_secrets_found += len(detected_in_output)
-            patterns_found.extend([d["pattern"] for d in detected_in_output])
+    if tool_output:
+        if isinstance(tool_output, str):
+            _, detected_in_output = mask_all_secrets(tool_output)
+            if detected_in_output:
+                total_secrets_found += len(detected_in_output)
+                patterns_found.extend([d["pattern"] for d in detected_in_output])
+        elif isinstance(tool_output, dict):
+            _, detected_out_count = inspect_and_mask_tool_payload(tool_name, tool_output)
+            if detected_out_count:
+                total_secrets_found += detected_out_count
 
     if total_secrets_found > 0:
         unique_patterns = sorted(list(set(patterns_found)))
@@ -587,7 +770,7 @@ def run_self_tests() -> bool:
         test_results.append((name, passed, detail))
 
     # TC1: Google AI Studio API Key (AIza...)
-    raw_google = "Connecting to Gemini with api_key = " + "AIzaSy" + "D9x7a1029384756102938475610293847."
+    raw_google = "Connecting to Gemini with api_key = AIzaSyD9x7a1029384756102938475610293847."
     masked_google, d1 = mask_all_secrets(raw_google)
     record(
         "TC1: Google AI Studio API Key masking",
@@ -619,7 +802,7 @@ def run_self_tests() -> bool:
     )
 
     # TC5: GitHub Personal Access Token (ghp_...)
-    raw_ghp = "Authorization: token " + "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"
+    raw_ghp = "Authorization: token ghp_16C7e42F292c6912E7710c838347Ae178B4a"
     masked_ghp, d5 = mask_all_secrets(raw_ghp)
     record(
         "TC5: GitHub PAT masking",
@@ -628,9 +811,9 @@ def run_self_tests() -> bool:
 
     # TC6: RSA Private Key Block
     raw_rsa = (
-        "-----" + "BEGIN " + "RSA " + "PRIVATE " + "KEY-----\n"
+        "-----BEGIN RSA PRIVATE KEY-----\n"
         "MIIEowIBAAKCAQEA0Y1+g4H7Z8n5k2Q/6Q9e0v4uYmP0t9uF1...\n"
-        "-----" + "END " + "RSA " + "PRIVATE " + "KEY-----"
+        "-----END RSA PRIVATE KEY-----"
     )
     masked_rsa, d6 = mask_all_secrets(raw_rsa)
     record(
@@ -684,7 +867,7 @@ def run_self_tests() -> bool:
             "name": "write_to_file",
             "args": {
                 "TargetFile": "src/config.py",
-                "CodeContent": "API_KEY = '" + "AIzaSy" + "D9x7a1029384756102938475610293847'",
+                "CodeContent": "API_KEY = 'AIzaSyD9x7a1029384756102938475610293847'",
             },
         }
     }
@@ -796,6 +979,83 @@ def run_self_tests() -> bool:
     record(
         "TC19: 0% False Positive on timestamps, git hashes, ports, and bytes",
         fp_text == masked_fp and len(d19) == 0,
+    )
+
+    # TC20: Vietnamese PII with NFD decomposition
+    raw_nfd = "ch\u01b0\u0301ng minh nh\u00e2n d\u00e2n: 123456789"
+    masked_nfd, d20 = mask_all_secrets(raw_nfd)
+    record(
+        "TC20: Vietnamese PII with NFD decomposition normalization",
+        "123***789" in masked_nfd and "123456789" not in masked_nfd and any(d["pattern"] == "VN_CMND" for d in d20),
+    )
+
+    # TC21: Vietnamese PII with Full-Width digits
+    raw_fw = "Thong tin CCCD: \uff10\uff10\uff11\uff10\uff19\uff18\uff10\uff11\uff12\uff13\uff14\uff15 cua khach."
+    masked_fw, d21 = mask_all_secrets(raw_fw)
+    record(
+        "TC21: Vietnamese PII with Full-Width digits normalization",
+        "001******345" in masked_fw and "\uff10\uff10\uff11" not in masked_fw and any(d["pattern"] == "VN_CCCD" for d in d21),
+    )
+
+    # TC22: Multi-layer double URL-encoded secret
+    raw_double_url = "curl https://api.com?key=%2541%2549%257a%2561SyD9x7a1029384756102938475610293847"
+    masked_double_url, d22 = mask_all_secrets(raw_double_url)
+    record(
+        "TC22: Multi-layer double URL-encoded secret deobfuscation",
+        "AIza" in masked_double_url and "D9x7" not in masked_double_url and any(d["pattern"] == "GOOGLE_AI_KEY" for d in d22),
+    )
+
+    # TC23: Unicode escapes and HTML entities
+    raw_escapes = r"api_key = \u0041\u0049\u007a\u0061SyD9x7a1029384756102938475610293847 and token = &#x41;&#x49;&#x7a;&#x61;SyD9x7a1029384756102938475610293847"
+    masked_escapes, d23 = mask_all_secrets(raw_escapes)
+    record(
+        "TC23: Unicode escapes and HTML entities secret deobfuscation",
+        "AIza" in masked_escapes and "D9x7" not in masked_escapes and any(d["pattern"] == "GOOGLE_AI_KEY" for d in d23),
+    )
+
+    # TC24: Homoglyph-obfuscated credentials
+    raw_homo = "api_key = AIz\u0430SyD9x7a1029384756102938475610293847 and blob = K9z8X7v6W5u4T3s2R1q0P9\u043e8N7m6L5k4J3h2G1"
+    masked_homo, d24 = mask_all_secrets(raw_homo)
+    record(
+        "TC24: Homoglyph-obfuscated secrets mapping and high entropy detection",
+        "AIza" in masked_homo and "D9x7" not in masked_homo and any(d["pattern"] == "GOOGLE_AI_KEY" for d in d24) and any(d["pattern"] == "HIGH_SHANNON_ENTROPY_TOKEN" for d in d24),
+    )
+
+    # TC25: Zero-width & invisible character defragmentation
+    raw_zw = "api_key = AI\u200bza\u200cSy\ufeffD9x7a\u00ad1029384756102938475610293847"
+    masked_zw, d25 = mask_all_secrets(raw_zw)
+    record(
+        "TC25: Zero-width & invisible character defragmentation",
+        "AIza" in masked_zw and "D9x7" not in masked_zw and any(d["pattern"] == "GOOGLE_AI_KEY" for d in d25),
+    )
+
+    # TC26: Database URI with URL-encoded characters in password
+    raw_db_encoded = "DATABASE_URL=postgresql://postgres:Super%40Secret%3APass:123@db.example.com:5432/production"
+    masked_db_encoded, d26 = mask_all_secrets(raw_db_encoded)
+    record(
+        "TC26: Database URI with URL-encoded characters (%40, %3A, colons) in password",
+        "Super%40Secret" not in masked_db_encoded and "********@db.example.com:5432/production" in masked_db_encoded and any(d["pattern"] == "DATABASE_URI_PASSWORD" for d in d26),
+    )
+
+    # TC27: Database URI with %40 as delimiter before host
+    raw_db_delim = "DATABASE_URL=postgresql://postgres:MySecretPass%40db.example.com:5432/production"
+    masked_db_delim, d27 = mask_all_secrets(raw_db_delim)
+    record(
+        "TC27: Database URI with %40 as delimiter before host",
+        "MySecretPass" not in masked_db_delim and any("DATABASE_URI_PASSWORD" in d["pattern"] for d in d27),
+    )
+
+    # TC28: Tool payload recursive inspection
+    tool_args_test = {
+        "query": "Tìm kiếm CCCD",
+        "db": "postgresql://postgres:pass%40word@db.local:5432/main",
+        "secret": "%2541%2549%257a%2561SyD9x7a1029384756102938475610293847",
+        "pii": "ch\u01b0\u0301ng minh nh\u00e2n d\u00e2n: 123456789",
+    }
+    sanitized_payload, total_found = inspect_and_mask_tool_payload("test_tool", tool_args_test)
+    record(
+        "TC28: Complex tool payload recursive inspection and masking",
+        total_found >= 3 and "pass%40word" not in sanitized_payload["db"] and "123456789" not in sanitized_payload["pii"],
     )
 
     all_passed = all(p for _, p, _ in test_results)

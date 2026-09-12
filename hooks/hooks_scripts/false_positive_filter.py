@@ -14,12 +14,71 @@ Usage:
     filtered_results = filter.filter_results(raw_results, diff_content)
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
+import os
 import re
+import shutil
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+
+class CrossProcessLock:
+    """Robust cross-process file lock supporting Windows (msvcrt) and POSIX (fcntl)."""
+
+    def __init__(self, lock_file: Path | str, timeout: float = 10.0):
+        self.lock_file = Path(lock_file)
+        self.timeout = timeout
+        self.fd: int | None = None
+
+    def __enter__(self) -> CrossProcessLock:
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT)
+        start_time = time.monotonic()
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() - start_time > self.timeout:
+                    if self.fd is not None:
+                        try:
+                            os.close(self.fd)
+                        except OSError:
+                            pass
+                    self.fd = None
+                    raise TimeoutError(f"Timed out waiting for file lock: {self.lock_file}")
+                time.sleep(0.02)
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self.fd is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    os.lseek(self.fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
 
 
 def _paths_match(p1: str, p2: str) -> bool:
@@ -188,6 +247,7 @@ class FalsePositiveFilter:
         self.whitelist: list[WhitelistEntry] = []
         self.context_patterns: list[ContextPattern] = []
         self.learning_data: dict[str, int] = {}  # pattern -> correction_count
+        self._load_failed: bool = False
         self._load_whitelist()
         self._init_context_patterns()
 
@@ -196,31 +256,55 @@ class FalsePositiveFilter:
         return str(Path(__file__).parent / "false_positive_whitelist.json")
 
     def _load_whitelist(self) -> None:
-        """Load whitelist from disk."""
+        """Load whitelist from disk with retry and corruption detection."""
         if not self.whitelist_path or self.whitelist_path == ":memory:":
+            self._load_failed = False
             return
         whitelist_file = Path(self.whitelist_path)
-        if whitelist_file.exists():
+        if not whitelist_file.exists():
+            self._load_failed = False
+            return
+
+        lock_file = whitelist_file.parent / f".{whitelist_file.name}.lock"
+        for attempt in range(3):
             try:
-                with open(whitelist_file, encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.whitelist = [
-                        WhitelistEntry(**entry) for entry in data.get("entries", [])
-                    ]
-                    self.learning_data = data.get("learning_data", {})
-            except (json.JSONDecodeError, TypeError) as e:
-                print(f"Warning: Could not load whitelist: {e}")
-                self.whitelist = []
+                with CrossProcessLock(lock_file, timeout=2.0):
+                    with open(whitelist_file, encoding="utf-8") as f:
+                        data = json.load(f)
+                        self.whitelist = [
+                            WhitelistEntry(**entry) for entry in data.get("entries", [])
+                        ]
+                        self.learning_data = data.get("learning_data", {})
+                        self._load_failed = False
+                        return
+            except (json.JSONDecodeError, TypeError, OSError) as e:
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+                else:
+                    sys.stderr.write(f"[WARNING] Could not load whitelist from '{self.whitelist_path}': {e}\n")
+                    self.whitelist = []
+                    self._load_failed = True
 
     def _save_whitelist(self) -> None:
-        """Save whitelist to disk."""
+        """Save whitelist to disk atomically. Refuses overwrite if load failed to prevent permanent purge."""
         if not self.whitelist_path or self.whitelist_path == ":memory:":
             return
+
+        if getattr(self, "_load_failed", False):
+            sys.stderr.write(
+                f"[WARNING] Refusing to overwrite whitelist at '{self.whitelist_path}' "
+                f"because previous load encountered errors. Preserving existing disk file to prevent permanent purge.\n"
+            )
+            return
+
         whitelist_file = Path(self.whitelist_path)
         whitelist_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = whitelist_file.parent / f".{whitelist_file.name}.lock"
+        temp_file = whitelist_file.parent / f".{whitelist_file.name}.tmp.{os.getpid()}.{time.time_ns()}"
+
         try:
-            with open(whitelist_file, "w", encoding="utf-8") as f:
-                json.dump({
+            with CrossProcessLock(lock_file, timeout=10.0):
+                payload = {
                     "entries": [
                         {
                             "pattern": e.pattern,
@@ -238,9 +322,32 @@ class FalsePositiveFilter:
                     ],
                     "learning_data": self.learning_data,
                     "last_updated": datetime.now().isoformat(),
-                }, f, indent=2)
+                }
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except (OSError, AttributeError):
+                        pass
+
+                for attempt in range(10):
+                    try:
+                        os.replace(temp_file, whitelist_file)
+                        break
+                    except PermissionError:
+                        if attempt < 9:
+                            time.sleep(0.02 * (attempt + 1))
+                        else:
+                            raise
         except Exception as e:
-            print(f"Warning: Could not save whitelist: {e}")
+            sys.stderr.write(f"[WARNING] Could not save whitelist: {e}\n")
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _init_context_patterns(self) -> None:
         """Initialize context-aware patterns for common false positive scenarios."""
@@ -300,6 +407,17 @@ class FalsePositiveFilter:
         line_end: int | None = None,
     ) -> None:
         """Add a new entry to the whitelist."""
+        if getattr(self, "_load_failed", False):
+            whitelist_file = Path(self.whitelist_path)
+            if whitelist_file.exists():
+                try:
+                    corrupted_bak = whitelist_file.with_suffix(f".corrupted.{int(time.time())}.bak")
+                    shutil.copy2(whitelist_file, corrupted_bak)
+                    sys.stderr.write(f"[WARNING] Backed up corrupted whitelist to {corrupted_bak} before adding new entry.\n")
+                except Exception:
+                    pass
+            self._load_failed = False
+
         entry = WhitelistEntry(
             pattern=pattern,
             pattern_type=pattern_type,
@@ -609,3 +727,89 @@ def filter_raw_results(
     filter_instance = FalsePositiveFilter(whitelist_path)
     filtered = filter_instance.filter_results(findings, diff_content)
     return [f.to_dict() for f in filtered]
+
+
+def run_self_tests() -> bool:
+    """Self-test suite for false_positive_filter.py."""
+    print("======================================================================")
+    print("Running False Positive Filter Self-Test Suite")
+    print("======================================================================\n")
+
+    test_dir = Path(__file__).resolve().parent.parent / "tmp" / f"test_fp_filter_{os.getpid()}"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    test_wl = test_dir / "test_whitelist.json"
+
+    try:
+        # 1. Test normal creation and atomic persistence
+        fp_filter = FalsePositiveFilter(str(test_wl))
+        fp_filter.add_to_whitelist(
+            pattern="test_rule_01",
+            pattern_type="rule_id",
+            reason="Test FP reason",
+            author="DevWorker6",
+        )
+        assert test_wl.exists(), "Whitelist file was not created"
+        with open(test_wl, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert len(data.get("entries", [])) == 1, "Expected 1 whitelist entry"
+        assert data["entries"][0]["pattern"] == "test_rule_01"
+        print("[PASS] Test 1: Whitelist saved atomically with correct entry.")
+
+        # 2. Test reload from disk
+        fp_filter2 = FalsePositiveFilter(str(test_wl))
+        assert not fp_filter2._load_failed, "Load should not be marked as failed"
+        assert len(fp_filter2.whitelist) == 1, "Should reload 1 entry"
+        assert fp_filter2.whitelist[0].pattern == "test_rule_01"
+        print("[PASS] Test 2: Whitelist cleanly reloaded from disk.")
+
+        # 3. Test corruption handling and refusal to purge (Mục 42)
+        corrupted_content = "{ corrupted json entries: [..."
+        with open(test_wl, "w", encoding="utf-8") as f:
+            f.write(corrupted_content)
+
+        # Loading corrupted file must set _load_failed = True
+        fp_filter3 = FalsePositiveFilter(str(test_wl))
+        assert fp_filter3._load_failed is True, "_load_failed flag was not set on corrupted file"
+        assert len(fp_filter3.whitelist) == 0, "Whitelist in memory should be empty"
+
+        # Calling _save_whitelist() must REFUSE to overwrite the disk file
+        fp_filter3._save_whitelist()
+        with open(test_wl, "r", encoding="utf-8") as f:
+            current_content = f.read()
+        assert current_content == corrupted_content, "Corrupted file was wiped by _save_whitelist! Purge protection failed!"
+        print("[PASS] Test 3: Purge protection verified: _save_whitelist refused to overwrite corrupted file.")
+
+        # 4. Test safe backup on explicit new add_to_whitelist
+        fp_filter3.add_to_whitelist(
+            pattern="new_rule_after_corrupt",
+            pattern_type="rule_id",
+            reason="Recovering with new item",
+        )
+        backups = list(test_dir.glob("*.corrupted.*.bak"))
+        assert len(backups) > 0, "Backup of corrupted file was not created before overwrite"
+        with open(backups[0], "r", encoding="utf-8") as f:
+            bk_content = f.read()
+        assert bk_content == corrupted_content, "Backup content does not match original corrupted content"
+        with open(test_wl, "r", encoding="utf-8") as f:
+            recovered_data = json.load(f)
+        assert len(recovered_data.get("entries", [])) == 1
+        assert recovered_data["entries"][0]["pattern"] == "new_rule_after_corrupt"
+        print("[PASS] Test 4: Corrupted file safely backed up before explicit new entry addition.")
+
+        # 5. Test CrossProcessLock under concurrent simulation
+        lock_file = test_dir / "test.lock"
+        with CrossProcessLock(lock_file, timeout=2.0):
+            pass
+        print("[PASS] Test 5: CrossProcessLock acquired and released cleanly.")
+
+        print("\n[SELF-TEST] false_positive_filter.py: All tests PASSED with 100% success!")
+        return True
+    finally:
+        if test_dir.exists():
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        success = run_self_tests()
+        sys.exit(0 if success else 1)

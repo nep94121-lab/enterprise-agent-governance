@@ -51,10 +51,15 @@ from common_hook_lib import (  # noqa: E402
     get_tool_args,
     get_tool_call,
     get_workspace_roots,
+    has_ntfs_ads,
+    is_hardlink,
+    is_reparse_point,
+    is_reserved_device_name,
     log_diagnostic,
     normalize_path,
     post_tool_response,
     read_stdin_payload,
+    strip_unc_prefix,
 )
 
 # Optional dynamic configuration loader from hook_utils package
@@ -229,6 +234,17 @@ def is_safe_target_path(
     if "\x00" in path_str:
         return False, "Path contains prohibited null byte"
 
+    # Check 1b: NTFS Alternate Data Stream (ADS)
+    if has_ntfs_ads(path_str):
+        return False, f"Target path contains prohibited NTFS Alternate Data Stream: {path_str}"
+
+    # Check 1c: Windows UNC Volume GUID prefix and reserved devices
+    clean_p, p_type = strip_unc_prefix(path_str)
+    if p_type == "VOLUME_GUID":
+        return False, f"Target path uses prohibited Volume GUID prefix: {path_str}"
+    if is_reserved_device_name(clean_p):
+        return False, f"Target path refers to Windows reserved device name: {clean_p}"
+
     # Check 2: Argument injection via leading hyphen
     if target_path.name.startswith("-") or path_str.strip().startswith("-"):
         return False, f"Target path begins with hyphen; potential option injection: {target_path.name}"
@@ -240,7 +256,7 @@ def is_safe_target_path(
 
     # Check 3: Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
     if config.get("block_windows_device_names", True):
-        if resolved.stem.lower() in WINDOWS_RESERVED_DEVICE_NAMES:
+        if is_reserved_device_name(resolved.stem) or resolved.stem.lower() in WINDOWS_RESERVED_DEVICE_NAMES:
             return False, f"Blocked access to Windows reserved device name: {resolved.stem}"
 
     # Check 4: Critical OS system directories
@@ -404,9 +420,19 @@ def run_auto_lint(payload: dict[str, Any]) -> dict[str, Any]:
     linter_args = list(config.get("linter_args", FALLBACK_AUTO_LINT_CONFIG["linter_args"]))
     if "--no-cache" not in linter_args and "--cache-dir" not in linter_args:
         linter_args.append("--no-cache")
+
+    # Protect NTFS hardlinks from auto-fix mutations
+    if is_hardlink(target_path):
+        log_diagnostic(f"Target '{target_path}' is an NTFS hardlink (st_nlink > 1); removing '--fix' to protect shared link integrity.")
+        linter_args = [arg for arg in linter_args if arg != "--fix"]
+
     cmd = [resolved_linter, *linter_args, "--", str(target_path)]
 
     timeout_sec = config.get("timeout_seconds", FALLBACK_AUTO_LINT_CONFIG["timeout_seconds"])
+
+    # Determine safe working directory
+    workspace_roots = get_workspace_roots(payload)
+    effective_cwd = workspace_roots[0] if workspace_roots else target_path.parent
 
     try:
         trigger_msg = config.get("messages", {}).get("trigger_lint", "Triggering auto-lint for: {target_path}")
@@ -414,6 +440,7 @@ def run_auto_lint(payload: dict[str, Any]) -> dict[str, Any]:
 
         result = subprocess.run(
             cmd,
+            cwd=str(effective_cwd),
             capture_output=True,
             text=True,
             encoding="utf-8",

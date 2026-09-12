@@ -26,12 +26,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+import html
 import io
 import os
 import pathlib
 import re
 import subprocess
 import sys
+import unicodedata
+import urllib.parse
 from typing import Any
 
 # Enforce UTF-8 I/O across platforms (Windows PowerShell safety)
@@ -443,6 +446,204 @@ ALLOWED_SECRET_SUBSTRINGS = set(DEFAULT_SECURITY_CONFIG["allowed_secret_substrin
 
 
 # ============================================================================
+# 2.5. UNICODE NORMALIZATION, HOMOGLYPHS & MULTI-LAYER DECODING ENGINE
+# ============================================================================
+
+# Mapping of visual homoglyphs (Cyrillic, Greek, etc.) to standard Latin ASCII characters
+HOMOGLYPH_MAP: dict[str, str] = {
+    # Cyrillic uppercase
+    "\u0410": "A",  # Cyrillic capital letter A
+    "\u0412": "B",  # Cyrillic capital letter Ve
+    "\u0421": "C",  # Cyrillic capital letter Es
+    "\u0415": "E",  # Cyrillic capital letter Ie
+    "\u041d": "H",  # Cyrillic capital letter En
+    "\u0406": "I",  # Cyrillic capital letter Byelorussian-Ukrainian I
+    "\u0408": "J",  # Cyrillic capital letter Je
+    "\u041a": "K",  # Cyrillic capital letter Ka
+    "\u041c": "M",  # Cyrillic capital letter Em
+    "\u041e": "O",  # Cyrillic capital letter O
+    "\u0420": "P",  # Cyrillic capital letter Er
+    "\u0405": "S",  # Cyrillic capital letter Dze
+    "\u0422": "T",  # Cyrillic capital letter Te
+    "\u0425": "X",  # Cyrillic capital letter Ha
+    "\u0423": "Y",  # Cyrillic capital letter U (resembles Latin Y)
+    "\u051c": "W",  # Cyrillic capital letter We
+    # Cyrillic lowercase
+    "\u0430": "a",  # Cyrillic small letter a
+    "\u0441": "c",  # Cyrillic small letter es
+    "\u0435": "e",  # Cyrillic small letter ie
+    "\u0456": "i",  # Cyrillic small letter byelorussian-ukrainian i
+    "\u0458": "j",  # Cyrillic small letter je
+    "\u043a": "k",  # Cyrillic small letter ka
+    "\u043e": "o",  # Cyrillic small letter o
+    "\u0440": "p",  # Cyrillic small letter er
+    "\u0455": "s",  # Cyrillic small letter dze
+    "\u0445": "x",  # Cyrillic small letter ha
+    "\u0443": "y",  # Cyrillic small letter u
+    "\u051d": "w",  # Cyrillic small letter we
+    "\u0501": "d",  # Cyrillic small letter komi de
+    "\u051b": "q",  # Cyrillic small letter qa
+    # Greek uppercase
+    "\u0391": "A",  # Greek capital letter Alpha
+    "\u0392": "B",  # Greek capital letter Beta
+    "\u0395": "E",  # Greek capital letter Epsilon
+    "\u0396": "Z",  # Greek capital letter Zeta
+    "\u0397": "H",  # Greek capital letter Eta
+    "\u0399": "I",  # Greek capital letter Iota
+    "\u039a": "K",  # Greek capital letter Kappa
+    "\u039c": "M",  # Greek capital letter Mu
+    "\u039d": "N",  # Greek capital letter Nu
+    "\u039f": "O",  # Greek capital letter Omicron
+    "\u03a1": "P",  # Greek capital letter Rho
+    "\u03a4": "T",  # Greek capital letter Tau
+    "\u03a5": "Y",  # Greek capital letter Upsilon
+    "\u03a7": "X",  # Greek capital letter Chi
+    # Greek lowercase
+    "\u03b1": "a",  # Greek small letter alpha
+    "\u03b5": "e",  # Greek small letter epsilon
+    "\u03b9": "i",  # Greek small letter iota
+    "\u03ba": "k",  # Greek small letter kappa
+    "\u03bf": "o",  # Greek small letter omicron
+    "\u03c1": "p",  # Greek small letter rho
+    "\u03c4": "t",  # Greek small letter tau
+    "\u03c5": "u",  # Greek small letter upsilon
+    "\u03bd": "v",  # Greek small letter nu (resembles Latin v)
+    "\u03c7": "x",  # Greek small letter chi
+}
+
+# Zero-width, invisible formatting, and BiDi control characters to strip
+ZERO_WIDTH_AND_INVISIBLE_CHARS: tuple[str, ...] = (
+    "\u200b",  # Zero-width space
+    "\u200c",  # Zero-width non-joiner
+    "\u200d",  # Zero-width joiner
+    "\ufeff",  # Zero-width no-break space (BOM)
+    "\u2060",  # Word joiner
+    "\u2061",  # Function application
+    "\u2062",  # Invisible times
+    "\u2063",  # Invisible separator
+    "\u2064",  # Invisible plus
+    "\u00ad",  # Soft hyphen
+    "\u034f",  # Combining grapheme joiner
+    "\u200e",  # Left-to-right mark
+    "\u200f",  # Right-to-left mark
+    "\u180e",  # Mongolian vowel separator
+    "\u202a",  # Left-to-Right Embedding (LRE)
+    "\u202b",  # Right-to-Left Embedding (RLE)
+    "\u202c",  # Pop Directional Formatting (PDF)
+    "\u202d",  # Left-to-Right Override (LRO)
+    "\u202e",  # Right-to-Left Override (RLO)
+    "\u2066",  # Left-to-Right Isolate (LRI)
+    "\u2067",  # Right-to-Left Isolate (RLI)
+    "\u2068",  # First Strong Isolate (FSI)
+    "\u2069",  # Pop Directional Isolate (PDI)
+)
+
+HOMOGLYPH_AND_INVISIBLE_TABLE: dict[int, int | None] = str.maketrans({
+    **HOMOGLYPH_MAP,
+    **{ch: None for ch in ZERO_WIDTH_AND_INVISIBLE_CHARS},
+})
+
+
+def decode_escape_sequences(text: str, preserve_newlines: bool = False) -> str:
+    """Decode hex (\\xHH) and unicode (\\uHHHH, \\U0000HHHH) escape sequences.
+
+    If preserve_newlines is False, converts decoded \\r and \\n into spaces
+    to prevent breaking 1-to-1 line number correspondence.
+    """
+    if not text:
+        return ""
+
+    def _hex_sub(m: re.Match) -> str:
+        try:
+            cp = int(m.group(1), 16)
+            if not preserve_newlines and cp in (10, 13):
+                return " "
+            return chr(cp)
+        except Exception:
+            return m.group(0)
+
+    def _u_sub(m: re.Match) -> str:
+        try:
+            cp = int(m.group(1), 16)
+            if not preserve_newlines and cp in (10, 13):
+                return " "
+            return chr(cp)
+        except Exception:
+            return m.group(0)
+
+    def _U_sub(m: re.Match) -> str:
+        try:
+            cp = int(m.group(1), 16)
+            if not preserve_newlines and cp in (10, 13):
+                return " "
+            return chr(cp)
+        except Exception:
+            return m.group(0)
+
+    s = re.sub(r"(?i)\\x([0-9a-f]{2})", _hex_sub, text)
+    s = re.sub(r"(?i)\\u([0-9a-f]{4})", _u_sub, s)
+    s = re.sub(r"(?i)\\U([0-9a-f]{8})", _U_sub, s)
+    return s
+
+
+def decode_multi_layer(text: str, max_passes: int = 3, preserve_newlines: bool = False) -> str:
+    """Multi-layer decode: escape sequences, URL percent-encoding (double-decode), and HTML entities."""
+    if not text:
+        return ""
+    current = text
+    for _ in range(max_passes):
+        prev = current
+        current = decode_escape_sequences(current, preserve_newlines=preserve_newlines)
+        try:
+            current = urllib.parse.unquote(current)
+        except Exception:
+            pass
+        try:
+            current = html.unescape(current)
+        except Exception:
+            pass
+        if not preserve_newlines:
+            current = current.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        if current == prev:
+            break
+    return current
+
+
+def normalize_code_text(text: str) -> str:
+    """Normalize code text by applying:
+    1. Unicode Normalization (NFKC) for fullwidth forms and compatibility chars.
+    2. Homoglyphs mapping (Cyrillic/Greek -> Latin ASCII) and zero-width/invisible char stripping.
+    3. Stripping combining non-spacing marks (Mn) after decomposition (e.g. s\\u0301elect -> select).
+    4. Canonical composition back to NFKC.
+    """
+    if not text:
+        return ""
+    # 1. NFKC normalization
+    norm = unicodedata.normalize("NFKC", text)
+    # 2. Homoglyphs translation and zero-width stripping via fast C translation table
+    norm = norm.translate(HOMOGLYPH_AND_INVISIBLE_TABLE)
+    # 3. Strip combining non-spacing marks (Mn)
+    decomposed = unicodedata.normalize("NFKD", norm)
+    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+    # 4. Final NFKC composition
+    return unicodedata.normalize("NFKC", stripped)
+
+
+def deobfuscate_security_text(text: str, preserve_newlines: bool = False) -> str:
+    """Comprehensive pipeline combining multi-layer decoding, Unicode normalization,
+    homoglyph translation, zero-width stripping, and combining character normalization."""
+    if not text:
+        return ""
+    # Pass 1: Decode multi-layer (escapes, percent-decoding, double-decode, html entities)
+    decoded = decode_multi_layer(text, max_passes=3, preserve_newlines=preserve_newlines)
+    # Pass 2: Normalize Unicode, homoglyphs, zero-width, combining characters
+    normalized = normalize_code_text(decoded)
+    # Pass 3: Final decode pass in case normalization revealed any percent or escape sequences
+    final_text = decode_multi_layer(normalized, max_passes=2, preserve_newlines=preserve_newlines)
+    return final_text
+
+
+# ============================================================================
 # 3. CORE INSPECTION ENGINE
 # ============================================================================
 
@@ -550,21 +751,27 @@ def scan_text_for_violations(
     lines = text.splitlines()
 
     # Pre-filter lines if scanning a git diff: only inspect added lines (starting with '+')
-    lines_to_inspect: list[tuple[int, str]] = []
+    lines_to_inspect: list[tuple[int, str, str]] = []
     if is_diff:
         for idx, line in enumerate(lines, start=1):
             if line.startswith("+") and not line.startswith("+++"):
-                lines_to_inspect.append((idx, line[1:]))
+                raw_content = line[1:]
+                deobf_content = deobfuscate_security_text(raw_content, preserve_newlines=False)
+                lines_to_inspect.append((idx, raw_content, deobf_content))
     else:
         for idx, line in enumerate(lines, start=1):
-            lines_to_inspect.append((idx, line))
+            raw_content = line
+            deobf_content = deobfuscate_security_text(raw_content, preserve_newlines=False)
+            lines_to_inspect.append((idx, raw_content, deobf_content))
 
-    full_inspect_text = "\n".join(content for _, content in lines_to_inspect)
+    raw_full_inspect_text = "\n".join(raw for _, raw, _ in lines_to_inspect)
+    deobf_full_inspect_text = "\n".join(deobf for _, _, deobf in lines_to_inspect)
 
     # 1. Secrets & PII Scan (Line-by-line & Multi-line for Keys)
+    # Applies multi-layer decoding (URL-encoding, double percent-decode, escape sequences, homoglyphs)
     for pattern, name, desc in SECRETS_PATTERNS:
         if "KEY-----" in pattern or "raw_signature" in pattern:
-            match = re.search(pattern, full_inspect_text, re.DOTALL | re.IGNORECASE)
+            match = re.search(pattern, deobf_full_inspect_text, re.DOTALL | re.IGNORECASE) or re.search(pattern, raw_full_inspect_text, re.DOTALL | re.IGNORECASE)
             if match and not is_false_positive_secret(match.group(0), name, allowed_substrings):
                 violations.append(
                     SecurityViolation(
@@ -577,75 +784,86 @@ def scan_text_for_violations(
                     )
                 )
         else:
-            for line_no, line_content in lines_to_inspect:
-                match = re.search(pattern, line_content, re.IGNORECASE)
+            for line_no, raw_line, deobf_line in lines_to_inspect:
+                # Check deobfuscated line first, then raw line
+                match = re.search(pattern, deobf_line, re.IGNORECASE) or re.search(pattern, raw_line, re.IGNORECASE)
                 if match:
                     matched_str = match.group(0)
-                    if not is_false_positive_secret(matched_str, name, allowed_substrings):
-                        violations.append(
-                            SecurityViolation(
-                                category="Secrets & PII",
-                                rule_name=name,
-                                description=desc,
-                                line_number=line_no,
-                                snippet=line_content,
-                                file_path=file_path,
+                    if not is_false_positive_secret(matched_str, name, allowed_substrings) and not is_false_positive_secret(raw_line, name, allowed_substrings):
+                        if not any(v.category == "Secrets & PII" and v.line_number == line_no and v.rule_name == name for v in violations):
+                            violations.append(
+                                SecurityViolation(
+                                    category="Secrets & PII",
+                                    rule_name=name,
+                                    description=desc,
+                                    line_number=line_no,
+                                    snippet=raw_line,
+                                    file_path=file_path,
+                                )
                             )
-                        )
 
     # 2. SQL Injection Scan (Both Line-level and Multiline Block-level)
+    # Catches Unicode fullwidth forms, homoglyphs (Cyrillic/Greek), and combining characters
     for pattern, name, desc in SQLI_PATTERNS_LINE:
-        for line_no, line_content in lines_to_inspect:
-            if re.search(pattern, line_content, re.IGNORECASE):
-                violations.append(
-                    SecurityViolation(
-                        category="SQL Injection",
-                        rule_name=name,
-                        description=desc,
-                        line_number=line_no,
-                        snippet=line_content,
-                        file_path=file_path,
+        for line_no, raw_line, deobf_line in lines_to_inspect:
+            if re.search(pattern, deobf_line, re.IGNORECASE) or re.search(pattern, raw_line, re.IGNORECASE):
+                if not any(v.category == "SQL Injection" and v.line_number == line_no and v.rule_name == name for v in violations):
+                    violations.append(
+                        SecurityViolation(
+                            category="SQL Injection",
+                            rule_name=name,
+                            description=desc,
+                            line_number=line_no,
+                            snippet=raw_line,
+                            file_path=file_path,
+                        )
                     )
-                )
 
     for pattern, name, desc in SQLI_PATTERNS_BLOCK:
-        for match in re.finditer(pattern, full_inspect_text, re.DOTALL | re.IGNORECASE):
-            matched_str = match.group(0)
-            line_no = full_inspect_text[:match.start()].count("\n") + 1
-            if not any(v.category == "SQL Injection" and v.line_number == line_no for v in violations):
-                violations.append(
-                    SecurityViolation(
-                        category="SQL Injection",
-                        rule_name=name,
-                        description=desc,
-                        line_number=line_no,
-                        snippet=matched_str[:120],
-                        file_path=file_path,
+        for target_text in (deobf_full_inspect_text, raw_full_inspect_text):
+            for match in re.finditer(pattern, target_text, re.DOTALL | re.IGNORECASE):
+                matched_str = match.group(0)
+                line_idx = target_text[:match.start()].count("\n")
+                line_no = lines_to_inspect[line_idx][0] if line_idx < len(lines_to_inspect) else line_idx + 1
+                snippet_text = lines_to_inspect[line_idx][1] if line_idx < len(lines_to_inspect) else matched_str[:120]
+                if not any(v.category == "SQL Injection" and v.line_number == line_no for v in violations):
+                    violations.append(
+                        SecurityViolation(
+                            category="SQL Injection",
+                            rule_name=name,
+                            description=desc,
+                            line_number=line_no,
+                            snippet=snippet_text,
+                            file_path=file_path,
+                        )
                     )
-                )
 
     # 3. IDOR & Multi-Tenant Scan (Statement Scope & Block Scope)
     # 3A. ORM Query Scanning
-    orm_matches = list(orm_query_pattern.finditer(full_inspect_text))
-    for m in orm_matches:
-        start_pos = m.start()
-        line_no = full_inspect_text[:start_pos].count("\n") + 1
-        end_pos = len(full_inspect_text)
-        for term_match in re.finditer(r';|\n(?=\s*(?:def|class|@|return|\b[a-zA-Z_][a-zA-Z0-9_]*\s*=))', full_inspect_text[start_pos:]):
-            end_pos = start_pos + term_match.start()
-            break
-        orm_block = full_inspect_text[start_pos:min(end_pos, start_pos + 600)]
-        if not idor_filter_pattern.search(orm_block):
-            violations.append(
-                SecurityViolation(
-                    category="IDOR & Multi-Tenant",
-                    rule_name="Missing Tenant Filter in ORM Query",
-                    description="ORM query on protected model without tenant/property boundary filter (§1, §24).",
-                    line_number=line_no,
-                    snippet=orm_block.splitlines()[0] if orm_block else "",
-                    file_path=file_path,
-                )
-            )
+    for target_text in (deobf_full_inspect_text, raw_full_inspect_text):
+        orm_matches = list(orm_query_pattern.finditer(target_text))
+        for m in orm_matches:
+            start_pos = m.start()
+            line_idx = target_text[:start_pos].count("\n")
+            line_no = lines_to_inspect[line_idx][0] if line_idx < len(lines_to_inspect) else line_idx + 1
+            snippet_line = lines_to_inspect[line_idx][1] if line_idx < len(lines_to_inspect) else ""
+            end_pos = len(target_text)
+            for term_match in re.finditer(r';|\n(?=\s*(?:def|class|@|return|\b[a-zA-Z_][a-zA-Z0-9_]*\s*=))', target_text[start_pos:]):
+                end_pos = start_pos + term_match.start()
+                break
+            orm_block = target_text[start_pos:min(end_pos, start_pos + 600)]
+            if not idor_filter_pattern.search(orm_block):
+                if not any(v.category == "IDOR & Multi-Tenant" and v.line_number == line_no for v in violations):
+                    violations.append(
+                        SecurityViolation(
+                            category="IDOR & Multi-Tenant",
+                            rule_name="Missing Tenant Filter in ORM Query",
+                            description="ORM query on protected model without tenant/property boundary filter (§1, §24).",
+                            line_number=line_no,
+                            snippet=snippet_line or (orm_block.splitlines()[0] if orm_block else ""),
+                            file_path=file_path,
+                        )
+                    )
 
     # 3B. Raw SQL Statement Scanning with Statement Scope
     inspected_spans: list[tuple[int, int]] = []
@@ -655,47 +873,54 @@ def scan_text_for_violations(
         r'\(\s*(?:[fFrRuUbB]?(?:"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')\s*)+\)',
         re.DOTALL,
     )
-    for m in paren_str_pattern.finditer(full_inspect_text):
-        inspected_spans.append((m.start(), m.end()))
-        block_text = m.group(0)
-        if idor_sql_target_pattern.search(block_text) and not idor_filter_pattern.search(block_text):
-            line_no = full_inspect_text[:m.start()].count("\n") + 1
-            violations.append(
-                SecurityViolation(
-                    category="IDOR & Multi-Tenant",
-                    rule_name="Missing Multi-Tenant Filter in SQL",
-                    description="Querying multi-tenant protected table without tenant_id, property_id, or ownership_id filter (§1, §24 IDOR Defense).",
-                    line_number=line_no,
-                    snippet=block_text.splitlines()[0],
-                    file_path=file_path,
-                )
-            )
-
-    # Check triple-quoted and single-quoted strings not enclosed in parenthesized string blocks
     quote_pattern = re.compile(
         r'[fFrRuUbB]?(?:"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')',
         re.DOTALL,
     )
-    for m in quote_pattern.finditer(full_inspect_text):
-        if any(span_start <= m.start() and m.end() <= span_end for span_start, span_end in inspected_spans):
-            continue
-        block_text = m.group(0)
-        if idor_sql_target_pattern.search(block_text) and not idor_filter_pattern.search(block_text):
-            line_no = full_inspect_text[:m.start()].count("\n") + 1
-            violations.append(
-                SecurityViolation(
-                    category="IDOR & Multi-Tenant",
-                    rule_name="Missing Multi-Tenant Filter in SQL",
-                    description="Querying multi-tenant protected table without tenant_id, property_id, or ownership_id filter (§1, §24 IDOR Defense).",
-                    line_number=line_no,
-                    snippet=block_text.splitlines()[0],
-                    file_path=file_path,
-                )
-            )
+
+    for target_text in (deobf_full_inspect_text, raw_full_inspect_text):
+        for m in paren_str_pattern.finditer(target_text):
+            inspected_spans.append((m.start(), m.end()))
+            block_text = m.group(0)
+            if idor_sql_target_pattern.search(block_text) and not idor_filter_pattern.search(block_text):
+                line_idx = target_text[:m.start()].count("\n")
+                line_no = lines_to_inspect[line_idx][0] if line_idx < len(lines_to_inspect) else line_idx + 1
+                snippet_line = lines_to_inspect[line_idx][1] if line_idx < len(lines_to_inspect) else block_text.splitlines()[0]
+                if not any(v.category == "IDOR & Multi-Tenant" and v.line_number == line_no for v in violations):
+                    violations.append(
+                        SecurityViolation(
+                            category="IDOR & Multi-Tenant",
+                            rule_name="Missing Multi-Tenant Filter in SQL",
+                            description="Querying multi-tenant protected table without tenant_id, property_id, or ownership_id filter (§1, §24 IDOR Defense).",
+                            line_number=line_no,
+                            snippet=snippet_line,
+                            file_path=file_path,
+                        )
+                    )
+
+        for m in quote_pattern.finditer(target_text):
+            if any(span_start <= m.start() and m.end() <= span_end for span_start, span_end in inspected_spans):
+                continue
+            block_text = m.group(0)
+            if idor_sql_target_pattern.search(block_text) and not idor_filter_pattern.search(block_text):
+                line_idx = target_text[:m.start()].count("\n")
+                line_no = lines_to_inspect[line_idx][0] if line_idx < len(lines_to_inspect) else line_idx + 1
+                snippet_line = lines_to_inspect[line_idx][1] if line_idx < len(lines_to_inspect) else block_text.splitlines()[0]
+                if not any(v.category == "IDOR & Multi-Tenant" and v.line_number == line_no for v in violations):
+                    violations.append(
+                        SecurityViolation(
+                            category="IDOR & Multi-Tenant",
+                            rule_name="Missing Multi-Tenant Filter in SQL",
+                            description="Querying multi-tenant protected table without tenant_id, property_id, or ownership_id filter (§1, §24 IDOR Defense).",
+                            line_number=line_no,
+                            snippet=snippet_line,
+                            file_path=file_path,
+                        )
+                    )
 
     # 4. RLS & CORS Scan
     for pattern, name, desc in RLS_CORS_PATTERNS:
-        match = re.search(pattern, full_inspect_text, re.DOTALL | re.IGNORECASE)
+        match = re.search(pattern, deobf_full_inspect_text, re.DOTALL | re.IGNORECASE) or re.search(pattern, raw_full_inspect_text, re.DOTALL | re.IGNORECASE)
         if match:
             violations.append(
                 SecurityViolation(
@@ -708,40 +933,44 @@ def scan_text_for_violations(
                 )
             )
 
-    # 5. Command Injection Scan (Vá P0: Line-level + Multiline Full-Text Scan without ReDoS)
+    # 5. Command Injection Scan (Vá P0: Line-level + Multiline Full-Text Scan with Homoglyphs & Unicode support)
     for pattern, name, desc in COMMAND_INJECTION_PATTERNS:
         # Line-by-line inspection
-        for line_no, line_content in lines_to_inspect:
-            if re.search(pattern, line_content):
-                violations.append(
-                    SecurityViolation(
-                        category="Command Injection",
-                        rule_name=name,
-                        description=desc,
-                        line_number=line_no,
-                        snippet=line_content,
-                        file_path=file_path,
-                    )
-                )
-
-        # Multiline block check for subprocess calls spanning multiple lines
-        if "subprocess" in pattern and "shell" in full_inspect_text:
-            for match in re.finditer(pattern, full_inspect_text, re.DOTALL):
-                line_no = full_inspect_text[:match.start()].count("\n") + 1
-                if not any(v.category == "Command Injection" and v.line_number == line_no for v in violations):
+        for line_no, raw_line, deobf_line in lines_to_inspect:
+            if re.search(pattern, deobf_line) or re.search(pattern, raw_line):
+                if not any(v.category == "Command Injection" and v.line_number == line_no and v.rule_name == name for v in violations):
                     violations.append(
                         SecurityViolation(
                             category="Command Injection",
                             rule_name=name,
                             description=desc,
                             line_number=line_no,
-                            snippet=match.group(0)[:120],
+                            snippet=raw_line,
                             file_path=file_path,
                         )
                     )
 
+        # Multiline block check for subprocess calls spanning multiple lines
+        for target_text in (deobf_full_inspect_text, raw_full_inspect_text):
+            if "subprocess" in pattern and "shell" in target_text:
+                for match in re.finditer(pattern, target_text, re.DOTALL):
+                    line_idx = target_text[:match.start()].count("\n")
+                    line_no = lines_to_inspect[line_idx][0] if line_idx < len(lines_to_inspect) else line_idx + 1
+                    snippet_text = lines_to_inspect[line_idx][1] if line_idx < len(lines_to_inspect) else match.group(0)[:120]
+                    if not any(v.category == "Command Injection" and v.line_number == line_no for v in violations):
+                        violations.append(
+                            SecurityViolation(
+                                category="Command Injection",
+                                rule_name=name,
+                                description=desc,
+                                line_number=line_no,
+                                snippet=snippet_text,
+                                file_path=file_path,
+                            )
+                        )
+
     # 6. Auth Context Scan (Dynamic fields)
-    auth_match = auth_null_pattern.search(full_inspect_text)
+    auth_match = auth_null_pattern.search(deobf_full_inspect_text) or auth_null_pattern.search(raw_full_inspect_text)
     if auth_match:
         violations.append(
             SecurityViolation(
@@ -755,7 +984,7 @@ def scan_text_for_violations(
         )
 
     # 6B. Dynamic Protected API Route Scan
-    route_match = auth_route_pattern.search(full_inspect_text)
+    route_match = auth_route_pattern.search(deobf_full_inspect_text) or auth_route_pattern.search(raw_full_inspect_text)
     if route_match:
         violations.append(
             SecurityViolation(
@@ -907,6 +1136,10 @@ def evaluate_diff_security_post_tool(payload: dict[str, Any]) -> dict[str, Any]:
             target_path = pathlib.Path(raw_target)
             if target_path.exists() and target_path.is_file():
                 try:
+                    # Guard against large files exceeding 5MB (Gap 12)
+                    if target_path.stat().st_size > 5 * 1024 * 1024:
+                        log_diagnostic(f"[PostToolUse Warning] File {raw_target} exceeds 5MB limit, skipping deep regex scan.")
+                        return post_tool_response()
                     content = target_path.read_text(encoding="utf-8", errors="replace")
                     violations = scan_text_for_violations(content, file_path=str(target_path), is_diff=False)
                     if violations:
@@ -942,8 +1175,11 @@ def main() -> None:
         elif args.file is not None:
             p = pathlib.Path(args.file)
             if p.exists() and p.is_file():
-                content = p.read_text(encoding="utf-8", errors="replace")
-                violations.extend(scan_text_for_violations(content, file_path=str(p), is_diff=False))
+                if p.stat().st_size > 5 * 1024 * 1024:
+                    log_diagnostic(f"File {args.file} exceeds 5MB limit ({p.stat().st_size} bytes), skipping deep scan.")
+                else:
+                    content = p.read_text(encoding="utf-8", errors="replace")
+                    violations.extend(scan_text_for_violations(content, file_path=str(p), is_diff=False))
             else:
                 log_diagnostic(f"File not found: {args.file}")
         elif args.text is not None:

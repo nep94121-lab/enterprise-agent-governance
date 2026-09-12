@@ -7,7 +7,7 @@ def check_grounding_compliance(audit_log_path="audit.log"):
     # It counts search_web vs decision_count.
     # If coverage < 80%, it issues a WARN.
     # If it detects a bypass, it issues an ALERT.
-
+    
     search_web_count = 0
     decision_count = 0
     bypass_detected = False
@@ -30,15 +30,15 @@ def check_grounding_compliance(audit_log_path="audit.log"):
             # Simulated data if log doesn't exist yet
             search_web_count = 5
             decision_count = 10
-
+            
     except Exception as e:
         print(f"Error reading audit log: {e}", file=sys.stderr)
-
+        
     coverage = (search_web_count / decision_count * 100) if decision_count > 0 else 100
-
+    
     if coverage < 80:
         print(f"WARN: Grounding coverage is {coverage:.2f}% (< 80%).", file=sys.stderr)
-
+        
     if bypass_detected:
         print("ALERT: Grounding bypass detected!", file=sys.stderr)
         sys.exit(1)

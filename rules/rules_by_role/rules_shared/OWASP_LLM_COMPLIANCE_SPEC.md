@@ -1,7 +1,7 @@
 # 🛡️ OWASP TOP 10 FOR LLM APPLICATIONS — QUY CHUẨN BẢO MẬT & TUÂN THỦ TÁC TỬ DOANH NGHIỆP
-**Mã Quy Chuẩn:** `SPEC-OWASP-LLM-SEC-2026`
-**Phiên bản:** `2.0.0 (Enterprise Multi-Agent Edition)`
-**Cấp độ ưu tiên:** `P0 (BẮT BUỘC TUÂN THỦ TRÊN TOÀN HỆ THỐNG)`
+**Mã Quy Chuẩn:** `SPEC-OWASP-LLM-SEC-2026`  
+**Phiên bản:** `2.0.0 (Enterprise Multi-Agent Edition)`  
+**Cấp độ ưu tiên:** `P0 (BẮT BUỘC TUÂN THỦ TRÊN TOÀN HỆ THỐNG)`  
 **Áp dụng:** Toàn bộ Sub-agents, PMs, Dev Workers, Reviewers, Challengers, Auditors.
 
 ---
@@ -28,7 +28,7 @@ Quy chuẩn này chuẩn hóa **10 rủi ro bảo mật cốt lõi theo OWASP To
 ## II. 10 HẠNG MỤC RỦI RO OWASP TOP 10 CHO LLM & BIỆN PHÁP CƯỠNG CHẾ
 
 ### 1. 🛑 LLM01: Prompt Injection (Tấn Công Chèn Lệnh Trực Tiếp & Gián Tiếp)
-- **Bản chất rủi ro:**
+- **Bản chất rủi ro:** 
   * *Trực tiếp (Direct Injection / Jailbreak):* Kẻ tấn công hoặc prompt độc hại cố tình ghi đè system prompt bằng các câu lệnh như `"Ignore previous instructions and do X"`.
   * *Gián tiếp (Indirect Prompt Injection):* Tác tử đọc tệp từ kho lưu trữ bên ngoài, cào trang web, hoặc duyệt git diff chứa các chỉ thị ẩn dụ (payload) hướng dẫn tác tử thực hiện hành vi phá hoại hoặc đánh cắp dữ liệu.
 - **Biện pháp cưỡng chế bắt buộc:**
@@ -133,7 +133,7 @@ Quy chuẩn này chuẩn hóa **10 rủi ro bảo mật cốt lõi theo OWASP To
 ---
 
 ### 10. ⚡ LLM10: Unbounded Consumption (Tiêu Thụ Tài Nguyên Vô Hạn & DoS)
-- **Bản chất rủi ro:** Tác tử rơi vào vòng lặp gọi tool vô tận (Infinite Loop), sinh subagent đệ quy không kiểm soát làm cạn kiệt RAM, CPU máy trạm (DYNAMIC_CPU_CORE_COUNT) và làm bùng nổ chi phí token API.
+- **Bản chất rủi ro:** Tác tử rơi vào vòng lặp gọi tool vô tận (Infinite Loop), sinh subagent đệ quy không kiểm soát làm cạn kiệt RAM, CPU máy trạm (4 nhân / 8 luồng) và làm bùng nổ chi phí token API.
 - **Biện pháp cưỡng chế bắt buộc:**
   1. **Bộ Điều Tốc Bể Đôi (Dual-Pool Concurrency Limits):**
      * **Bể 1 (Subagents Song Song):** Giới hạn tối đa **20 Subagents đồng thời**. Vượt quá phải chia Rolling Batches.

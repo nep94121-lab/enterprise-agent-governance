@@ -27,27 +27,33 @@ Key Capabilities:
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
+import os
 import pathlib
+import random
 import re
 import sys
 import threading
+import time
 import traceback
 import unicodedata
+import urllib.parse
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-# Enforce UTF-8 standard encoding on Windows PowerShell
+# Enforce UTF-8 standard encoding on Windows PowerShell with safe error replacement
 try:
     if hasattr(sys.stdin, "reconfigure"):
-        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except (AttributeError, io.UnsupportedOperation, ValueError):
     pass
 
@@ -89,9 +95,29 @@ except ImportError:
         sys.stderr.write(f"[HOOK-DIAGNOSTIC] {msg}\n")
 
     def read_stdin_payload(default: dict[str, Any] | None = None) -> dict[str, Any]:
+        raw = ""
+        max_bytes = 10 * 1024 * 1024
         try:
-            raw = sys.stdin.read()
-            return json.loads(raw) if raw.strip() else (default or {})
+            raw = sys.stdin.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw)} > {max_bytes} bytes).")
+                return default or {}
+        except UnicodeDecodeError:
+            try:
+                raw_bytes = getattr(sys.stdin, "buffer", None)
+                if raw_bytes is not None:
+                    chunk = raw_bytes.read(max_bytes + 1)
+                    if len(chunk) > max_bytes:
+                        log_diagnostic(f"STDIN payload exceeded maximum limit ({len(chunk)} > {max_bytes} bytes).")
+                        return default or {}
+                    raw = chunk.decode("utf-8", errors="replace")
+            except Exception:
+                return default or {}
+        except Exception:
+            return default or {}
+
+        try:
+            return json.loads(raw) if raw and raw.strip() else (default or {})
         except Exception:
             return default or {}
 
@@ -127,10 +153,151 @@ except Exception:
     _TIKTOKEN_ENCODER = None
 
 
+# Cross-process file lock registry and implementation (Mục 31)
+_LOCK_REGISTRY_MUTEX = threading.Lock()
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_LOCK_COUNTS: dict[str, int] = {}
+_LOCK_FDS: dict[str, int] = {}
+
+
+def _get_thread_lock(key: str) -> threading.RLock:
+    with _LOCK_REGISTRY_MUTEX:
+        if key not in _THREAD_LOCKS:
+            _THREAD_LOCKS[key] = threading.RLock()
+        return _THREAD_LOCKS[key]
+
+
+class CrossProcessLock:
+    """Robust cross-process file lock supporting Windows (msvcrt) and POSIX (fcntl).
+
+    Includes process/thread reentrancy protection to prevent self-deadlock
+    and intra-process thread synchronization to prevent race conditions.
+    """
+
+    def __init__(self, lock_file: pathlib.Path | str, timeout: float = 10.0):
+        self.lock_file = pathlib.Path(lock_file).resolve()
+        self.timeout = timeout
+        self.fd: int | None = None
+        self._key = str(self.lock_file)
+        self._tlock = _get_thread_lock(self._key)
+
+    def __enter__(self) -> CrossProcessLock:
+        start_time = time.monotonic()
+        acquired_thread = self._tlock.acquire(timeout=self.timeout)
+        if not acquired_thread:
+            raise TimeoutError(f"Timed out waiting for intra-process thread lock: {self.lock_file}")
+
+        try:
+            with _LOCK_REGISTRY_MUTEX:
+                if _LOCK_COUNTS.get(self._key, 0) > 0:
+                    _LOCK_COUNTS[self._key] += 1
+                    self.fd = _LOCK_FDS[self._key]
+                    return self
+
+            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT)
+            while True:
+                try:
+                    if sys.platform == "win32":
+                        import msvcrt
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                    with _LOCK_REGISTRY_MUTEX:
+                        _LOCK_COUNTS[self._key] = 1
+                        _LOCK_FDS[self._key] = fd
+                    self.fd = fd
+                    return self
+                except OSError:
+                    if time.monotonic() - start_time > self.timeout:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                        raise TimeoutError(f"Timed out waiting for file lock: {self.lock_file}")
+                    time.sleep(0.01 + random.uniform(0.005, 0.015))
+        except Exception:
+            self._tlock.release()
+            raise
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        try:
+            with _LOCK_REGISTRY_MUTEX:
+                count = _LOCK_COUNTS.get(self._key, 0)
+                if count > 1:
+                    _LOCK_COUNTS[self._key] = count - 1
+                    return
+                _LOCK_COUNTS.pop(self._key, None)
+                fd = _LOCK_FDS.pop(self._key, self.fd)
+
+            if fd is not None:
+                try:
+                    if sys.platform == "win32":
+                        import msvcrt
+                        try:
+                            os.lseek(fd, 0, os.SEEK_SET)
+                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                        except OSError:
+                            pass
+                    else:
+                        import fcntl
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+                finally:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self.fd = None
+        finally:
+            self._tlock.release()
+
+
+# Invisible and BiDi control characters
+# Covers Zero-Width spaces/joiners, BiDi marks/embeddings/overrides/isolates, CGJ, Soft Hyphen, Mongolian vowel separator
+INVISIBLE_AND_BIDI_REGEX = re.compile(
+    r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\u00ad\u180e\u034f]"
+)
+
+# Combining Grapheme Joiner specifically
+CGJ_CHAR = "\u034f"
+
+# Comprehensive Homoglyph translation mapping (Cyrillic & Greek -> Latin ASCII)
+HOMOGLYPH_MAP: dict[str, str] = {
+    # Cyrillic lowercase
+    "\u0430": "a", "\u0432": "b", "\u0433": "r", "\u0434": "d", "\u0435": "e",
+    "\u0436": "zh", "\u0437": "z", "\u0438": "i", "\u0439": "i", "\u043a": "k",
+    "\u043b": "l", "\u043c": "m", "\u043d": "h", "\u043e": "o", "\u043f": "n",
+    "\u0440": "p", "\u0441": "c", "\u0442": "t", "\u0443": "y", "\u0444": "f",
+    "\u0445": "x", "\u0446": "ts", "\u0447": "ch", "\u0448": "sh", "\u0449": "sh",
+    "\u044a": "", "\u044b": "y", "\u044c": "", "\u044d": "e", "\u044e": "yu",
+    "\u044f": "ya", "\u0456": "i", "\u0458": "j", "\u0455": "s",
+    # Cyrillic uppercase
+    "\u0410": "A", "\u0412": "B", "\u0415": "E", "\u041a": "K", "\u041c": "M",
+    "\u041d": "H", "\u041e": "O", "\u0420": "P", "\u0421": "C", "\u0422": "T",
+    "\u0425": "X", "\u0423": "Y",
+    # Greek lowercase
+    "\u03b1": "a", "\u03b2": "b", "\u03b3": "g", "\u03b4": "d", "\u03b5": "e",
+    "\u03b6": "z", "\u03b7": "h", "\u03b8": "th", "\u03b9": "i", "\u03ba": "k",
+    "\u03bb": "l", "\u03bc": "m", "\u03bd": "v", "\u03be": "x", "\u03bf": "o",
+    "\u03c0": "p", "\u03c1": "p", "\u03c2": "s", "\u03c3": "s", "\u03c4": "t",
+    "\u03c5": "u", "\u03c6": "f", "\u03c7": "x", "\u03c8": "ps", "\u03c9": "w",
+    # Greek uppercase
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0396": "Z", "\u0397": "H",
+    "\u0399": "I", "\u039a": "K", "\u039c": "M", "\u039d": "N", "\u039f": "O",
+    "\u03a1": "P", "\u03a4": "T", "\u03a5": "Y", "\u03a7": "X",
+}
+
 # Unicode character classification regex patterns
+# Regex matching Vietnamese accented characters in both precomposed (NFC) and decomposed (NFD combining marks)
 RE_VIETNAMESE_ACCENTED = re.compile(
     r"[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ"
-    r"ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]",
+    r"ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ"
+    r"\u0300-\u0303\u0306\u0309\u031b\u0323]",
     re.UNICODE,
 )
 RE_CJK = re.compile(
@@ -146,6 +313,124 @@ RE_ASCII_ALPHANUM = re.compile(
 RE_WHITESPACE = re.compile(
     r"\s"
 )
+
+
+def canonicalize_vietnamese_text(text: str) -> str:
+    """Canonicalize Vietnamese text handling NFD, CGJ (\u034f), and non-standard diacritic orders."""
+    if not text:
+        return ""
+    # Strip invisible/BiDi and CGJ so combining marks attach properly to base characters
+    cleaned = INVISIBLE_AND_BIDI_REGEX.sub("", text)
+    nfd_text = unicodedata.normalize("NFD", cleaned)
+    # Reorder if tone mark was placed before vowel modifier
+    nfd_reordered = re.sub(
+        r"([\u0300\u0301\u0303\u0309\u0323])([\u0302\u0306\u031b])",
+        r"\2\1",
+        nfd_text,
+    )
+    return unicodedata.normalize("NFKC", nfd_reordered)
+
+
+def normalize_role_identity(role: str) -> str:
+    """Normalize role identity using NFKC, homoglyph mapping, and case folding.
+
+    Prevents role identity spoofing, state fragmentation, and tracking bypasses caused
+    by Cyrillic/Greek homoglyphs, zero-width characters, or casing inconsistencies.
+    """
+    if not role or not isinstance(role, str):
+        return "default"
+    cleaned = INVISIBLE_AND_BIDI_REGEX.sub("", role)
+    norm = unicodedata.normalize("NFKC", cleaned)
+    mapped = "".join(HOMOGLYPH_MAP.get(ch, ch) for ch in norm)
+    folded = mapped.casefold().strip()
+    canonical = re.sub(r"[\s\-]+", "_", folded)
+    return canonical or "default"
+
+
+def decode_payload_multilayer(content: str, max_passes: int = 3) -> list[str]:
+    """Recursively decode multi-layer encoded content (URL percent-encoding, escapes, Base64).
+
+    Returns a list of decoded representations including the original string and unpacked layers.
+    """
+    if not content or not isinstance(content, str):
+        return [content] if content else []
+    variants: list[str] = [content]
+    seen: set[str] = {content}
+    current = content
+
+    for _ in range(max_passes):
+        changed = False
+
+        # Layer 1: URL / Percent-decoding (e.g. %20, %2520)
+        if "%" in current:
+            try:
+                unq = urllib.parse.unquote(current)
+                if unq != current and unq not in seen:
+                    variants.append(unq)
+                    seen.add(unq)
+                    current = unq
+                    changed = True
+            except Exception:
+                pass
+
+        # Layer 2: Escapes decoding (\uXXXX, \UXXXXXXXX, \xXX, \n, \t)
+        if "\\" in current:
+            try:
+                def _replace_escape(match: re.Match) -> str:
+                    esc = match.group(0)
+                    try:
+                        return esc.encode("utf-8").decode("unicode_escape")
+                    except Exception:
+                        return esc
+
+                dec_escapes = re.sub(
+                    r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|[nrtbfv\\'\"])",
+                    _replace_escape,
+                    current,
+                )
+                if dec_escapes != current and dec_escapes not in seen:
+                    variants.append(dec_escapes)
+                    seen.add(dec_escapes)
+                    current = dec_escapes
+                    changed = True
+            except Exception:
+                pass
+
+        # Layer 3: Base64 detection and decoding (supporting UTF-8 and UTF-16LE)
+        candidate_b64_matches = re.findall(r"[A-Za-z0-9+/]{16,}={0,2}", current)
+        for b64_cand in candidate_b64_matches:
+            try:
+                b64_bytes = base64.b64decode(b64_cand, validate=True)
+                decoded_str = None
+                # Check for null bytes indicative of UTF-16LE (e.g. PowerShell EncodedCommand)
+                if b"\x00" in b64_bytes:
+                    try:
+                        decoded_str = b64_bytes.decode("utf-16le")
+                    except UnicodeDecodeError:
+                        pass
+                if decoded_str is None:
+                    try:
+                        decoded_str = b64_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        try:
+                            decoded_str = b64_bytes.decode("utf-16le")
+                        except UnicodeDecodeError:
+                            pass
+
+                if decoded_str and decoded_str.strip() and decoded_str not in seen:
+                    printable_ratio = sum(1 for c in decoded_str if c.isprintable() or c in "\r\n\t") / max(1, len(decoded_str))
+                    if printable_ratio > 0.8:
+                        variants.append(decoded_str)
+                        seen.add(decoded_str)
+                        current = decoded_str
+                        changed = True
+            except Exception:
+                pass
+
+        if not changed:
+            break
+
+    return variants
 
 
 # Standard fallback configuration if dynamic_limits.json is unavailable
@@ -258,15 +543,26 @@ class TokenRatioEstimator:
                 tiktoken_tokens=0 if _TIKTOKEN_ENCODER else None,
             )
 
-        norm_text = unicodedata.normalize("NFC", text)
-        char_count = len(norm_text)
+        # 1. Canonicalize Vietnamese text (handles NFD, CGJ \u034f, and non-standard diacritic orders)
+        canon_text = canonicalize_vietnamese_text(text)
+
+        # 2. Normalize Unicode compatibility forms (Fullwidth ASCII, etc.) via NFKC
+        norm_text = unicodedata.normalize("NFKC", canon_text)
+
+        # 3. Filter invisible zero-width and BiDi control characters before token estimation and word splitting
+        clean_text = INVISIBLE_AND_BIDI_REGEX.sub("", norm_text)
+
+        char_count = len(clean_text)
+        if char_count == 0 and len(text) > 0:
+            char_count = len(text)
+            clean_text = text
 
         # Categorize characters
-        c_vn = len(RE_VIETNAMESE_ACCENTED.findall(norm_text))
-        c_cjk = len(RE_CJK.findall(norm_text))
-        c_code = len(RE_CODE_SYMBOLS.findall(norm_text))
-        c_ws = len(RE_WHITESPACE.findall(norm_text))
-        c_ascii = len(RE_ASCII_ALPHANUM.findall(norm_text))
+        c_vn = len(RE_VIETNAMESE_ACCENTED.findall(clean_text))
+        c_cjk = len(RE_CJK.findall(clean_text))
+        c_code = len(RE_CODE_SYMBOLS.findall(clean_text))
+        c_ws = len(RE_WHITESPACE.findall(clean_text))
+        c_ascii = len(RE_ASCII_ALPHANUM.findall(clean_text))
         c_other = max(0, char_count - (c_vn + c_cjk + c_code + c_ws + c_ascii))
 
         breakdown = {
@@ -292,7 +588,7 @@ class TokenRatioEstimator:
 
         # Vietnamese syllable-aware weighting:
         # Syllables with Vietnamese diacritics incur higher token density across the syllable.
-        words = norm_text.split()
+        words = clean_text.split()
         vn_words_chars = sum(len(w) for w in words if RE_VIETNAMESE_ACCENTED.search(w))
 
         if vn_words_chars > 0:
@@ -323,7 +619,7 @@ class TokenRatioEstimator:
         tiktoken_val: int | None = None
         if _TIKTOKEN_ENCODER is not None:
             try:
-                tiktoken_val = len(_TIKTOKEN_ENCODER.encode(norm_text))
+                tiktoken_val = len(_TIKTOKEN_ENCODER.encode(clean_text))
             except Exception:
                 tiktoken_val = None
 
@@ -350,14 +646,27 @@ class TokenBudgetGovernor:
         state_dir: pathlib.Path | str | None = None,
     ) -> None:
         self._lock = threading.RLock()
+        self._custom_config = config is not None
         self._config = config or self._fetch_dynamic_config()
         self._estimator = TokenRatioEstimator(self._config.get("ratios"))
 
-        # Storage resolution
-        raw_storage_dir = state_dir or self._config.get("state_storage_dir", ".token_budget")
-        self._state_dir = pathlib.Path(raw_storage_dir).resolve()
+        # Storage resolution - standardized global path to avoid CWD fragmentation (Mục 32)
+        env_storage = os.environ.get("TOKEN_BUDGET_STORAGE_PATH")
+        if state_dir:
+            self._state_dir = pathlib.Path(state_dir).resolve()
+        elif env_storage:
+            self._state_dir = pathlib.Path(env_storage).resolve()
+        else:
+            cfg_dir = self._config.get("state_storage_dir", ".token_budget")
+            p = pathlib.Path(cfg_dir)
+            if p.is_absolute():
+                self._state_dir = p.resolve()
+            else:
+                self._state_dir = (HOOKS_ROOT / p).resolve()
+
         state_file_name = self._config.get("state_file_name", "governor_state.json")
         self._state_file = self._state_dir / state_file_name
+        self._lock_file = self._state_dir / "governor.lock"
 
         # Runtime usage per role: { role: int }
         self._role_usage: dict[str, int] = {}
@@ -384,12 +693,13 @@ class TokenBudgetGovernor:
     def refresh_config(self, force_reload: bool = False) -> None:
         """Hot-reload configuration dynamically."""
         with self._lock:
-            self._config = self._fetch_dynamic_config()
-            self._estimator.update_ratios(self._config.get("ratios", FALLBACK_TOKEN_CONFIG["ratios"]))
+            if not getattr(self, "_custom_config", False) or force_reload:
+                self._config = self._fetch_dynamic_config()
+                self._estimator.update_ratios(self._config.get("ratios", FALLBACK_TOKEN_CONFIG["ratios"]))
 
     def get_role_budget(self, role: str) -> int:
-        """Get budget for a specific role dynamically."""
-        normalized_role = role.lower().strip()
+        """Get budget for a specific role dynamically with homoglyph-safe normalization."""
+        normalized_role = normalize_role_identity(role)
         role_budgets = self._config.get("role_budgets", FALLBACK_TOKEN_CONFIG["role_budgets"])
         if normalized_role in role_budgets:
             return int(role_budgets[normalized_role])
@@ -401,9 +711,29 @@ class TokenBudgetGovernor:
 
         return int(self._config.get("max_role_tokens", FALLBACK_TOKEN_CONFIG["max_role_tokens"]))
 
-    def estimate_tokens(self, text: str) -> TokenEstimationResult:
-        """Estimate token count for a piece of text."""
-        return self._estimator.estimate(text)
+    def estimate_tokens(self, text: str, decode_multilayer: bool = True) -> TokenEstimationResult:
+        """Estimate token count for a piece of text with optional multi-layer decoding.
+
+        Evaluates token consumption across raw and decoded variants (URL percent-decoding,
+        escape decoding, Base64 unpacking) to ensure no token limit or budget evasion.
+        """
+        if not decode_multilayer or not text:
+            return self._estimator.estimate(text)
+
+        variants = decode_payload_multilayer(text)
+        if len(variants) <= 1:
+            return self._estimator.estimate(text)
+
+        best_est: TokenEstimationResult | None = None
+        max_tokens = -1
+
+        for var in variants:
+            est = self._estimator.estimate(var)
+            if est.estimated_tokens > max_tokens:
+                max_tokens = est.estimated_tokens
+                best_est = est
+
+        return best_est if best_est is not None else self._estimator.estimate(text)
 
     def record_usage(
         self,
@@ -412,82 +742,84 @@ class TokenBudgetGovernor:
         token_type: str = "prompt",
         metadata: dict[str, Any] | None = None,
     ) -> TokenBudgetDecision:
-        """Record token consumption and evaluate budget thresholds."""
+        """Record token consumption and evaluate budget thresholds under cross-process lock."""
         with self._lock:
-            normalized_role = role.lower().strip()
-            budget = self.get_role_budget(normalized_role)
-            current = self._role_usage.get(normalized_role, 0)
-            projected = current + tokens
+            with CrossProcessLock(self._lock_file):
+                self._load_state_locked()
+                normalized_role = normalize_role_identity(role)
+                budget = self.get_role_budget(normalized_role)
+                current = self._role_usage.get(normalized_role, 0)
+                projected = current + tokens
 
-            self._role_usage[normalized_role] = projected
-            self._total_session_tokens += tokens
+                self._role_usage[normalized_role] = projected
+                self._total_session_tokens += tokens
 
-            if normalized_role not in self._role_flags:
-                self._role_flags[normalized_role] = {
-                    "warning": False,
-                    "critical": False,
-                    "exhausted": False,
+                if normalized_role not in self._role_flags:
+                    self._role_flags[normalized_role] = {
+                        "warning": False,
+                        "critical": False,
+                        "exhausted": False,
+                    }
+
+                flags = self._role_flags[normalized_role]
+                warn_ratio = float(self._config.get("warning_threshold_ratio", 0.80))
+                crit_ratio = float(self._config.get("critical_threshold_ratio", 0.95))
+                exhaust_ratio = float(self._config.get("exhausted_threshold_ratio", 1.00))
+
+                usage_pct = projected / budget if budget > 0 else 0.0
+
+                is_warning = usage_pct >= warn_ratio
+                is_critical = usage_pct >= crit_ratio
+                is_exhausted = usage_pct >= exhaust_ratio
+
+                suggestions: list[str] = []
+                allowed = True
+                decision = "allow"
+                verdict = "ALLOW"
+                reason = ""
+
+                if is_exhausted:
+                    flags["exhausted"] = True
+                    allowed = False
+                    decision = "deny"
+                    verdict = "DENY"
+                    reason = (
+                        f"Ngân sách token của vai trò '{normalized_role}' đã cạn kiệt "
+                        f"({projected}/{budget} tokens, {usage_pct:.1%}). Yêu cầu compact session ngay!"
+                    )
+                    suggestions.append("Kích hoạt session_compactor để thu gọn lịch sử.")
+                    suggestions.append("Bàn giao ngữ cảnh cô đọng qua progress.md.")
+                elif is_critical and not flags["critical"]:
+                    flags["critical"] = True
+                    reason = (
+                        f"CẢNH BÁO NGUY CẤP: Vai trò '{normalized_role}' đã dùng {usage_pct:.1%} "
+                        f"ngân sách ({projected}/{budget} tokens). Cần tóm tắt khẩn cấp!"
+                    )
+                    suggestions.append("Kích hoạt session compactor ngay.")
+                elif is_warning and not flags["warning"]:
+                    flags["warning"] = True
+                    reason = (
+                        f"CẢNH BÁO: Vai trò '{normalized_role}' đã đạt ngưỡng 80% "
+                        f"ngân sách ({projected}/{budget} tokens)."
+                    )
+                    suggestions.append("Chuẩn bị nén ngữ cảnh hoặc tóm tắt các bước trước.")
+
+                # Record transaction
+                txn = {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "role": normalized_role,
+                    "tokens": tokens,
+                    "token_type": token_type,
+                    "projected_usage": projected,
+                    "budget": budget,
+                    "usage_percentage": round(usage_pct, 4),
+                    "metadata": metadata or {},
                 }
+                self._transactions.append(txn)
+                if len(self._transactions) > 1000:
+                    self._transactions = self._transactions[-1000:]
 
-            flags = self._role_flags[normalized_role]
-            warn_ratio = float(self._config.get("warning_threshold_ratio", 0.80))
-            crit_ratio = float(self._config.get("critical_threshold_ratio", 0.95))
-            exhaust_ratio = float(self._config.get("exhausted_threshold_ratio", 1.00))
-
-            usage_pct = projected / budget if budget > 0 else 0.0
-
-            is_warning = usage_pct >= warn_ratio
-            is_critical = usage_pct >= crit_ratio
-            is_exhausted = usage_pct >= exhaust_ratio
-
-            suggestions: list[str] = []
-            allowed = True
-            decision = "allow"
-            verdict = "ALLOW"
-            reason = ""
-
-            if is_exhausted:
-                flags["exhausted"] = True
-                allowed = False
-                decision = "deny"
-                verdict = "DENY"
-                reason = (
-                    f"Ngân sách token của vai trò '{normalized_role}' đã cạn kiệt "
-                    f"({projected}/{budget} tokens, {usage_pct:.1%}). Yêu cầu compact session ngay!"
-                )
-                suggestions.append("Kích hoạt session_compactor để thu gọn lịch sử.")
-                suggestions.append("Bàn giao ngữ cảnh cô đọng qua progress.md.")
-            elif is_critical and not flags["critical"]:
-                flags["critical"] = True
-                reason = (
-                    f"CẢNH BÁO NGUY CẤP: Vai trò '{normalized_role}' đã dùng {usage_pct:.1%} "
-                    f"ngân sách ({projected}/{budget} tokens). Cần tóm tắt khẩn cấp!"
-                )
-                suggestions.append("Kích hoạt session compactor ngay.")
-            elif is_warning and not flags["warning"]:
-                flags["warning"] = True
-                reason = (
-                    f"CẢNH BÁO: Vai trò '{normalized_role}' đã đạt ngưỡng 80% "
-                    f"ngân sách ({projected}/{budget} tokens)."
-                )
-                suggestions.append("Chuẩn bị nén ngữ cảnh hoặc tóm tắt các bước trước.")
-
-            # Record transaction
-            txn = {
-                "timestamp": datetime.now(UTC).isoformat(),
-                "role": normalized_role,
-                "tokens": tokens,
-                "token_type": token_type,
-                "projected_usage": projected,
-                "budget": budget,
-                "usage_percentage": round(usage_pct, 4),
-                "metadata": metadata or {},
-            }
-            self._transactions.append(txn)
-            if len(self._transactions) > 1000:
-                self._transactions = self._transactions[-1000:]
-
-            self._save_state()
+                self._save_state_locked()
 
             return TokenBudgetDecision(
                 allowed=allowed,
@@ -512,176 +844,220 @@ class TokenBudgetGovernor:
         tool_name: str,
         tool_args: dict[str, Any],
         role: str = "default",
+        record_if_allowed: bool = False,
     ) -> TokenBudgetDecision:
-        """Evaluate a toolCall payload against token budget rules (PreToolUse)."""
+        """Evaluate a toolCall payload against token budget rules (PreToolUse) under cross-process lock."""
         with self._lock:
-            self.refresh_config()
-            normalized_role = role.lower().strip()
-            budget = self.get_role_budget(normalized_role)
-            current = self._role_usage.get(normalized_role, 0)
+            with CrossProcessLock(self._lock_file):
+                self._load_state_locked()
+                self.refresh_config()
+                normalized_role = normalize_role_identity(role)
+                budget = self.get_role_budget(normalized_role)
+                current = self._role_usage.get(normalized_role, 0)
 
-            # Inspect payload text
-            text_to_evaluate = ""
-            is_file_op = False
+                # Inspect payload text
+                text_to_evaluate = ""
+                is_file_op = False
 
-            if tool_name == "write_to_file":
-                text_to_evaluate = str(tool_args.get("CodeContent", ""))
-                is_file_op = True
-            elif tool_name == "replace_file_content":
-                text_to_evaluate = str(tool_args.get("ReplacementContent", ""))
-            elif tool_name == "invoke_subagent":
-                subagents = tool_args.get("Subagents", [])
-                if isinstance(subagents, list):
-                    text_to_evaluate = "\n".join(str(s.get("Prompt", "")) for s in subagents if isinstance(s, dict))
-            elif tool_name == "send_message":
-                text_to_evaluate = str(tool_args.get("Message", ""))
+                if tool_name == "write_to_file":
+                    text_to_evaluate = str(tool_args.get("CodeContent", ""))
+                    is_file_op = True
+                elif tool_name == "replace_file_content":
+                    text_to_evaluate = str(tool_args.get("ReplacementContent", ""))
+                elif tool_name == "invoke_subagent":
+                    subagents = tool_args.get("Subagents", [])
+                    if isinstance(subagents, list):
+                        prompts = [str(s.get("Prompt", "")) for s in subagents if isinstance(s, dict)]
+                        text_to_evaluate = "\n".join(prompts)
+                elif tool_name == "send_message":
+                    text_to_evaluate = str(tool_args.get("Message", ""))
 
-            est = self.estimate_tokens(text_to_evaluate)
-            tokens = est.estimated_tokens
-            projected = current + tokens
-            usage_pct = projected / budget if budget > 0 else 0.0
+                est = self.estimate_tokens(text_to_evaluate)
+                tokens = est.estimated_tokens
+                projected = current + tokens
+                usage_pct = projected / budget if budget > 0 else 0.0
 
-            # File size token ceiling check (§Rule file token limit: 4000 tokens)
-            max_file_tokens = int(self._config.get("max_rule_file_tokens", 4000))
-            if is_file_op and tokens > max_file_tokens:
-                target_file = str(tool_args.get("TargetFile", ""))
+                # File size token ceiling check (§Rule file token limit: 4000 tokens)
+                max_file_tokens = int(self._config.get("max_rule_file_tokens", 4000))
+                if is_file_op and tokens > max_file_tokens:
+                    target_file = str(tool_args.get("TargetFile", ""))
+                    return TokenBudgetDecision(
+                        allowed=False,
+                        decision="deny",
+                        verdict="DENY",
+                        role=normalized_role,
+                        current_usage=current,
+                        projected_usage=projected,
+                        budget=budget,
+                        usage_percentage=round(usage_pct, 4),
+                        warning_threshold=float(self._config.get("warning_threshold_ratio", 0.80)),
+                        critical_threshold=float(self._config.get("critical_threshold_ratio", 0.95)),
+                        reason=(
+                            f"Tệp '{pathlib.Path(target_file).name}' ước tính {tokens} tokens, "
+                            f"vượt trần giới hạn cho phép ({max_file_tokens} tokens) theo quy chuẩn doanh nghiệp!"
+                        ),
+                        suggestions=[
+                            f"Băm nhỏ tệp thành các module nhỏ hơn (mỗi module <= {max_file_tokens} tokens).",
+                            "Sử dụng kỹ thuật phân rã cấu trúc theo kiến trúc sạch.",
+                        ],
+                    )
+
+                # Anti-Verbosity / 'Lậm lời' check
+                verbosity_limit = int(self._config.get("verbosity_warning_tokens", 6000))
+                is_verbosity_warn = tokens > verbosity_limit
+                suggestions: list[str] = []
+                if is_verbosity_warn:
+                    suggestions.append(
+                        f"Cảnh báo 'lậm lời': Tin nhắn/nội dung ước tính {tokens} tokens "
+                        f"(vượt ngưỡng cảnh báo độ dài {verbosity_limit} tokens). Nên tóm tắt ngắn gọn."
+                    )
+
+                # Context window saturation check
+                context_window = int(self._config.get("default_context_window", 1000000))
+                if (self._total_session_tokens + tokens) > (context_window * 0.95):
+                    return TokenBudgetDecision(
+                        allowed=False,
+                        decision="deny",
+                        verdict="DENY",
+                        role=normalized_role,
+                        current_usage=current,
+                        projected_usage=projected,
+                        budget=budget,
+                        usage_percentage=round(usage_pct, 4),
+                        warning_threshold=float(self._config.get("warning_threshold_ratio", 0.80)),
+                        critical_threshold=float(self._config.get("critical_threshold_ratio", 0.95)),
+                        is_exhausted=True,
+                        reason=f"Cửa sổ ngữ cảnh phiên sắp cạn ({self._total_session_tokens + tokens}/{context_window} tokens).",
+                        suggestions=["Thu gọn lịch sử qua session_compactor ngay."],
+                    )
+
+                # Check role budget exhaustion
+                exhaust_ratio = float(self._config.get("exhausted_threshold_ratio", 1.00))
+                if usage_pct >= exhaust_ratio:
+                    return TokenBudgetDecision(
+                        allowed=False,
+                        decision="deny",
+                        verdict="DENY",
+                        role=normalized_role,
+                        current_usage=current,
+                        projected_usage=projected,
+                        budget=budget,
+                        usage_percentage=round(usage_pct, 4),
+                        warning_threshold=float(self._config.get("warning_threshold_ratio", 0.80)),
+                        critical_threshold=float(self._config.get("critical_threshold_ratio", 0.95)),
+                        is_exhausted=True,
+                        reason=(
+                            f"Lệnh sẽ làm vượt quá ngân sách vai trò '{normalized_role}' "
+                            f"({projected}/{budget} tokens, {usage_pct:.1%})."
+                        ),
+                        suggestions=["Nén context hoặc reset session trước khi tiếp tục."],
+                    )
+
+                warn_ratio = float(self._config.get("warning_threshold_ratio", 0.80))
+                crit_ratio = float(self._config.get("critical_threshold_ratio", 0.95))
+
+                if record_if_allowed and tokens > 0:
+                    self._role_usage[normalized_role] = projected
+                    self._total_session_tokens += tokens
+                    if normalized_role not in self._role_flags:
+                        self._role_flags[normalized_role] = {
+                            "warning": False,
+                            "critical": False,
+                            "exhausted": False,
+                        }
+                    flags = self._role_flags[normalized_role]
+                    if usage_pct >= crit_ratio:
+                        flags["critical"] = True
+                    elif usage_pct >= warn_ratio:
+                        flags["warning"] = True
+                    txn = {
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "role": normalized_role,
+                        "tokens": tokens,
+                        "token_type": tool_name,
+                        "projected_usage": projected,
+                        "budget": budget,
+                        "usage_percentage": round(usage_pct, 4),
+                        "metadata": {"tool_name": tool_name},
+                    }
+                    self._transactions.append(txn)
+                    if len(self._transactions) > 1000:
+                        self._transactions = self._transactions[-1000:]
+                    self._save_state_locked()
+
                 return TokenBudgetDecision(
-                    allowed=False,
-                    decision="deny",
-                    verdict="DENY",
+                    allowed=True,
+                    decision="allow",
+                    verdict="ALLOW",
                     role=normalized_role,
                     current_usage=current,
                     projected_usage=projected,
                     budget=budget,
                     usage_percentage=round(usage_pct, 4),
-                    warning_threshold=float(self._config.get("warning_threshold_ratio", 0.80)),
-                    critical_threshold=float(self._config.get("critical_threshold_ratio", 0.95)),
-                    reason=(
-                        f"Tệp '{pathlib.Path(target_file).name}' ước tính {tokens} tokens, "
-                        f"vượt trần giới hạn cho phép ({max_file_tokens} tokens) theo quy chuẩn doanh nghiệp!"
-                    ),
-                    suggestions=[
-                        f"Băm nhỏ tệp thành các module nhỏ hơn (mỗi module <= {max_file_tokens} tokens).",
-                        "Sử dụng kỹ thuật phân rã cấu trúc theo kiến trúc sạch.",
-                    ],
+                    warning_threshold=warn_ratio,
+                    critical_threshold=crit_ratio,
+                    is_warning=usage_pct >= warn_ratio,
+                    is_critical=usage_pct >= crit_ratio,
+                    is_verbosity_warning=is_verbosity_warn,
+                    reason="Kiểm tra ngân sách token thành công." if not is_verbosity_warn else suggestions[0],
+                    suggestions=suggestions,
                 )
 
-            # Anti-Verbosity / 'Lậm lời' check
-            verbosity_limit = int(self._config.get("verbosity_warning_tokens", 6000))
-            is_verbosity_warn = tokens > verbosity_limit
-            suggestions: list[str] = []
-            if is_verbosity_warn:
-                suggestions.append(
-                    f"Cảnh báo 'lậm lời': Tin nhắn/nội dung ước tính {tokens} tokens "
-                    f"(vượt ngưỡng cảnh báo độ dài {verbosity_limit} tokens). Nên tóm tắt ngắn gọn."
-                )
-
-            # Context window saturation check
-            context_window = int(self._config.get("default_context_window", 1000000))
-            if (self._total_session_tokens + tokens) > (context_window * 0.95):
-                return TokenBudgetDecision(
-                    allowed=False,
-                    decision="deny",
-                    verdict="DENY",
-                    role=normalized_role,
-                    current_usage=current,
-                    projected_usage=projected,
-                    budget=budget,
-                    usage_percentage=round(usage_pct, 4),
-                    warning_threshold=float(self._config.get("warning_threshold_ratio", 0.80)),
-                    critical_threshold=float(self._config.get("critical_threshold_ratio", 0.95)),
-                    is_exhausted=True,
-                    reason=f"Cửa sổ ngữ cảnh phiên sắp cạn ({self._total_session_tokens + tokens}/{context_window} tokens).",
-                    suggestions=["Thu gọn lịch sử qua session_compactor ngay."],
-                )
-
-            # Check role budget exhaustion
-            exhaust_ratio = float(self._config.get("exhausted_threshold_ratio", 1.00))
-            if usage_pct >= exhaust_ratio:
-                return TokenBudgetDecision(
-                    allowed=False,
-                    decision="deny",
-                    verdict="DENY",
-                    role=normalized_role,
-                    current_usage=current,
-                    projected_usage=projected,
-                    budget=budget,
-                    usage_percentage=round(usage_pct, 4),
-                    warning_threshold=float(self._config.get("warning_threshold_ratio", 0.80)),
-                    critical_threshold=float(self._config.get("critical_threshold_ratio", 0.95)),
-                    is_exhausted=True,
-                    reason=(
-                        f"Lệnh sẽ làm vượt quá ngân sách vai trò '{normalized_role}' "
-                        f"({projected}/{budget} tokens, {usage_pct:.1%})."
-                    ),
-                    suggestions=["Nén context hoặc reset session trước khi tiếp tục."],
-                )
-
-            warn_ratio = float(self._config.get("warning_threshold_ratio", 0.80))
-            crit_ratio = float(self._config.get("critical_threshold_ratio", 0.95))
-
-            return TokenBudgetDecision(
-                allowed=True,
-                decision="allow",
-                verdict="ALLOW",
-                role=normalized_role,
-                current_usage=current,
-                projected_usage=projected,
-                budget=budget,
-                usage_percentage=round(usage_pct, 4),
-                warning_threshold=warn_ratio,
-                critical_threshold=crit_ratio,
-                is_warning=usage_pct >= warn_ratio,
-                is_critical=usage_pct >= crit_ratio,
-                is_verbosity_warning=is_verbosity_warn,
-                reason="Kiểm tra ngân sách token thành công." if not is_verbosity_warn else suggestions[0],
-                suggestions=suggestions,
-            )
+    def _get_status_locked(self, normalized_role: str) -> dict[str, Any]:
+        """Get status summary for a specific role assuming lock is held."""
+        budget = self.get_role_budget(normalized_role)
+        used = self._role_usage.get(normalized_role, 0)
+        pct = used / budget if budget > 0 else 0.0
+        return {
+            "role": normalized_role,
+            "budget": budget,
+            "used": used,
+            "remaining": max(0, budget - used),
+            "percentage": round(pct, 4),
+            "percentage_display": f"{pct:.1%}",
+        }
 
     def get_status(self, role: str) -> dict[str, Any]:
-        """Get status summary for a specific role."""
+        """Get status summary for a specific role under cross-process lock."""
         with self._lock:
-            normalized_role = role.lower().strip()
-            budget = self.get_role_budget(normalized_role)
-            used = self._role_usage.get(normalized_role, 0)
-            pct = used / budget if budget > 0 else 0.0
-            return {
-                "role": normalized_role,
-                "budget": budget,
-                "used": used,
-                "remaining": max(0, budget - used),
-                "percentage": round(pct, 4),
-                "percentage_display": f"{pct:.1%}",
-            }
+            with CrossProcessLock(self._lock_file):
+                self._load_state_locked()
+                normalized_role = normalize_role_identity(role)
+                return self._get_status_locked(normalized_role)
 
     def get_all_statuses(self) -> dict[str, Any]:
-        """Get status summaries for all configured roles."""
+        """Get status summaries for all configured roles under cross-process lock."""
         with self._lock:
-            role_budgets = self._config.get("role_budgets", FALLBACK_TOKEN_CONFIG["role_budgets"])
-            statuses = {r: self.get_status(r) for r in role_budgets}
-            return {
-                "roles": statuses,
-                "total_session_tokens": self._total_session_tokens,
-                "context_window": self._config.get("default_context_window", 1000000),
-            }
+            with CrossProcessLock(self._lock_file):
+                self._load_state_locked()
+                role_budgets = self._config.get("role_budgets", {})
+                statuses = {r: self._get_status_locked(normalize_role_identity(r)) for r in role_budgets}
+                return {
+                    "roles": statuses,
+                    "total_session_tokens": self._total_session_tokens,
+                    "context_window": self._config.get("default_context_window", 1000000),
+                }
 
     def reset(self, role: str | None = None) -> None:
-        """Reset usage tracking for a specific role or entire session."""
+        """Reset usage tracking for a specific role or entire session under cross-process lock."""
         with self._lock:
-            if role:
-                r_norm = role.lower().strip()
-                self._role_usage[r_norm] = 0
-                if r_norm in self._role_flags:
-                    self._role_flags[r_norm] = {"warning": False, "critical": False, "exhausted": False}
-            else:
-                self._role_usage.clear()
-                self._role_flags.clear()
-                self._total_session_tokens = 0
-                self._transactions.clear()
-            self._save_state()
+            with CrossProcessLock(self._lock_file):
+                self._load_state_locked()
+                if role:
+                    r_norm = normalize_role_identity(role)
+                    self._role_usage[r_norm] = 0
+                    if r_norm in self._role_flags:
+                        self._role_flags[r_norm] = {"warning": False, "critical": False, "exhausted": False}
+                else:
+                    self._role_usage.clear()
+                    self._role_flags.clear()
+                    self._total_session_tokens = 0
+                    self._transactions.clear()
+                self._save_state_locked()
 
-    def _save_state(self) -> None:
-        """Persist state atomically to disk."""
+    def _save_state_locked(self) -> None:
+        """Persist state atomically to disk assuming cross-process lock is held."""
+        temp_file: pathlib.Path | None = None
         try:
             self._state_dir.mkdir(parents=True, exist_ok=True)
             data = {
@@ -690,23 +1066,65 @@ class TokenBudgetGovernor:
                 "total_session_tokens": self._total_session_tokens,
                 "last_updated": datetime.now(UTC).isoformat(),
             }
-            # Atomic write via temp file
-            temp_file = self._state_file.with_suffix(".tmp")
-            temp_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            temp_file.replace(self._state_file)
+            # Atomic write via unique temp file (Mục 35 pattern)
+            temp_file = self._state_file.with_suffix(
+                f".tmp.{os.getpid()}.{time.time_ns()}.{uuid.uuid4().hex[:6]}"
+            )
+            temp_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8", errors="replace")
+
+            # Retry on Windows NTFS lock contention (Mục 36 pattern)
+            for attempt in range(5):
+                try:
+                    temp_file.replace(self._state_file)
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (2 ** attempt))
         except Exception as exc:
             log_diagnostic(f"Failed to save governor state: {exc}")
+        finally:
+            # Deterministic cleanup of temp file (Mục 37 pattern)
+            if temp_file and temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+
+    def _save_state(self) -> None:
+        """Persist state atomically to disk under cross-process lock (Mục 31)."""
+        with CrossProcessLock(self._lock_file):
+            self._save_state_locked()
+
+    def _load_state_locked(self) -> None:
+        """Load state assuming cross-process lock is already held."""
+        if not self._state_file.exists():
+            return
+        try:
+            content = self._state_file.read_text(encoding="utf-8-sig", errors="replace")
+            if not content.strip():
+                return
+            data = json.loads(content)
+            if isinstance(data, dict):
+                disk_roles = data.get("role_usage", {})
+                if isinstance(disk_roles, dict):
+                    self._role_usage = {str(r): int(u) for r, u in disk_roles.items()}
+                disk_flags = data.get("role_flags", {})
+                if isinstance(disk_flags, dict):
+                    self._role_flags = {
+                        str(r): {str(k): bool(v) for k, v in flags.items()}
+                        for r, flags in disk_flags.items()
+                        if isinstance(flags, dict)
+                    }
+                self._total_session_tokens = int(data.get("total_session_tokens", 0))
+        except Exception as exc:
+            log_diagnostic(f"Failed to load governor state: {exc}")
 
     def _load_state(self) -> None:
-        """Load state safely from disk."""
+        """Load state safely from disk under cross-process lock (Mục 31)."""
         try:
-            if not self._state_file.exists():
-                return
-            data = json.loads(self._state_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                self._role_usage = data.get("role_usage", {})
-                self._role_flags = data.get("role_flags", {})
-                self._total_session_tokens = data.get("total_session_tokens", 0)
+            with CrossProcessLock(self._lock_file):
+                self._load_state_locked()
         except Exception as exc:
             log_diagnostic(f"Failed to load governor state: {exc}")
 
@@ -743,35 +1161,42 @@ def evaluate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if tool_call:
             tool_name = str(tool_call.get("name", ""))
             tool_args = get_tool_args(tool_call)
-            role = str(payload.get("role") or payload.get("agentRole") or "default")
+            role = normalize_role_identity(str(payload.get("role") or payload.get("agentRole") or "default"))
 
-            decision = governor.evaluate_tool_call(tool_name, tool_args, role=role)
+            with CrossProcessLock(governor._lock_file):
+                decision = governor.evaluate_tool_call(tool_name, tool_args, role=role)
 
-            if not decision.allowed:
-                return {
-                    "decision": "deny",
-                    "verdict": "DENY",
-                    "reason": decision.reason,
-                    "suggestions": decision.suggestions,
-                }
+                if not decision.allowed:
+                    return {
+                        "decision": "deny",
+                        "verdict": "DENY",
+                        "reason": decision.reason,
+                        "suggestions": decision.suggestions,
+                    }
 
-            # Record usage if applicable
-            est_tokens = 0
-            if tool_name == "write_to_file":
-                est_tokens = governor.estimate_tokens(str(tool_args.get("CodeContent", ""))).estimated_tokens
-            elif tool_name == "replace_file_content":
-                est_tokens = governor.estimate_tokens(str(tool_args.get("ReplacementContent", ""))).estimated_tokens
-            elif tool_name == "send_message":
-                est_tokens = governor.estimate_tokens(str(tool_args.get("Message", ""))).estimated_tokens
+                # Record usage if applicable (write_to_file, replace_file_content, send_message, invoke_subagent)
+                est_tokens = 0
+                if tool_name == "write_to_file":
+                    est_tokens = governor.estimate_tokens(str(tool_args.get("CodeContent", ""))).estimated_tokens
+                elif tool_name == "replace_file_content":
+                    est_tokens = governor.estimate_tokens(str(tool_args.get("ReplacementContent", ""))).estimated_tokens
+                elif tool_name == "send_message":
+                    est_tokens = governor.estimate_tokens(str(tool_args.get("Message", ""))).estimated_tokens
+                elif tool_name == "invoke_subagent":
+                    subagents = tool_args.get("Subagents", [])
+                    if isinstance(subagents, list):
+                        prompts = [str(s.get("Prompt", "")) for s in subagents if isinstance(s, dict)]
+                        combined_prompts = "\n".join(prompts)
+                        est_tokens = governor.estimate_tokens(combined_prompts).estimated_tokens
 
-            if est_tokens > 0:
-                governor.record_usage(role, est_tokens, token_type=tool_name)
+                if est_tokens > 0:
+                    governor.record_usage(role, est_tokens, token_type=tool_name)
 
-            res = pre_tool_response("allow", decision.reason)
-            res["verdict"] = "ALLOW"
-            if decision.suggestions:
-                res["suggestions"] = decision.suggestions
-            return res
+                res = pre_tool_response("allow", decision.reason)
+                res["verdict"] = "ALLOW"
+                if decision.suggestions:
+                    res["suggestions"] = decision.suggestions
+                return res
 
         # PostInvocation / PreInvocation evaluation
         inv_num = payload.get("invocationNum", 0)
@@ -980,6 +1405,138 @@ def run_self_tests() -> bool:
         "TC15: Thread-Safe Concurrent Recording",
         len(concurrency_errors) == 0 and total_tokens == 10000,
         f"(Total: {total_tokens}, Expected: 10000, Errors: {len(concurrency_errors)})",
+    )
+
+    # TC16: Fullwidth Forms & Unicode NFKC Normalization (Fullwidth "ＡＢＣ１２３" -> ASCII alphanum)
+    fullwidth_sample = "\uff21\uff22\uff23\uff11\uff12\uff13"  # Fullwidth "ABC123"
+    fw_est = governor.estimate_tokens(fullwidth_sample)
+    assert_test(
+        "TC16: Fullwidth Forms & Unicode NFKC Normalization",
+        fw_est.dominant_category == "ascii_alphanum" and fw_est.char_breakdown["cjk"] == 0 and fw_est.char_breakdown["ascii_alphanum"] == 6,
+        f"(Cat: {fw_est.dominant_category}, CJK: {fw_est.char_breakdown['cjk']}, ASCII: {fw_est.char_breakdown['ascii_alphanum']})",
+    )
+
+    # TC17: Homoglyph Role Identity Normalization & Budget Isolation
+    governor.reset()
+    # Record usage using Cyrillic homoglyph for 'p' in 'pm_orchestrator'
+    homoglyph_role = "\u0440m_orchestrator"  # Cyrillic 'р'
+    d_hg = governor.record_usage(homoglyph_role, 500)
+    canonical_status = governor.get_status("pm_orchestrator")
+    assert_test(
+        "TC17: Homoglyph Role Identity Normalization",
+        d_hg.role == "pm_orchestrator" and canonical_status["used"] == 500,
+        f"(Role: {d_hg.role}, Canonical used: {canonical_status['used']})",
+    )
+
+    # TC18: Multi-layer Payload Decoding (URL percent-encoding, escapes, Base64)
+    raw_secret_code = "def process_critical_system_task():\n" + ("    pass\n" * 50)
+    b64_code = base64.b64encode(raw_secret_code.encode("utf-8")).decode("ascii")
+    url_b64_payload = urllib.parse.quote(f"PREFIX_{b64_code}_SUFFIX")
+    variants = decode_payload_multilayer(url_b64_payload)
+    multi_est = governor.estimate_tokens(url_b64_payload, decode_multilayer=True)
+    assert_test(
+        "TC18: Multi-layer Payload Decoding (URL/Escapes/Base64)",
+        len(variants) >= 2 and any("process_critical_system_task" in v for v in variants) and multi_est.estimated_tokens > 0,
+        f"(Variants found: {len(variants)}, Tokens: {multi_est.estimated_tokens})",
+    )
+
+    # TC19: Zero-Width Characters & BiDi Controls Filtering in Vietnamese Word Boundary Splitting
+    zw_text = "ti\u200be\u034f\u0301\u0302ng Vi\u200e\u200f\u1ec7t"  # tiếng Việt with ZWSP, CGJ, BiDi marks
+    zw_est = governor.estimate_tokens(zw_text)
+    assert_test(
+        "TC19: Zero-Width & BiDi Controls Filtering in Word Splitting",
+        zw_est.char_breakdown["vietnamese_accented"] >= 2 and zw_est.effective_ratio < 3.0,
+        f"(Chars: {zw_est.char_count}, Tokens: {zw_est.estimated_tokens}, Ratio: {zw_est.effective_ratio})",
+    )
+
+    # TC20: Non-standard NFD & Combining Grapheme Joiner (\u034F) Canonicalization
+    nfd_cgj_sample = "e\u034f\u0301\u0302"  # e + CGJ + acute + circumflex -> should compose to ế
+    canon_res = canonicalize_vietnamese_text(nfd_cgj_sample)
+    assert_test(
+        "TC20: Non-standard NFD & CGJ Canonicalization",
+        canon_res == "ế",
+        f"(Canonicalized: {canon_res!r}, Expected: 'ế')",
+    )
+
+    # TC21: invoke_subagent Token Budget Accounting in evaluate_payload
+    global_gov = get_token_governor()
+    global_gov.reset("pm_orchestrator")
+    subagent_payload = {
+        "toolCall": {
+            "name": "invoke_subagent",
+            "args": {
+                "Subagents": [
+                    {"TypeName": "backend_developer", "Prompt": "Implement microservice authentication module with JWT tokens."},
+                    {"TypeName": "qa_challenger", "Prompt": "Audit boundary conditions and adversarial token payloads."},
+                ],
+            },
+        },
+        "role": "\u0440m_orchestrator",  # Cyrillic homoglyph test combined
+    }
+    sub_eval = evaluate_payload(subagent_payload)
+    pm_status = global_gov.get_status("pm_orchestrator")
+    assert_test(
+        "TC21: invoke_subagent Token Budget Accounting in evaluate_payload",
+        sub_eval.get("decision") == "allow" and pm_status["used"] > 0,
+        f"(Decision: {sub_eval.get('decision')}, PM Used: {pm_status['used']})",
+    )
+
+    # TC22: Robust Unicode Stdio & State File Decode Resilience
+    test_temp_state = governor._state_dir / "test_unicode_resilience.json"
+    test_temp_state.write_bytes(b"\xef\xbb\xbf{\"role_usage\": {\"resilience_test\": 123}, \"invalid\": \"\xff\xfe\"}")
+    read_ok = False
+    try:
+        data_read = json.loads(test_temp_state.read_text(encoding="utf-8-sig", errors="replace"))
+        read_ok = isinstance(data_read, dict) and data_read.get("role_usage", {}).get("resilience_test") == 123
+    except Exception:
+        read_ok = False
+    finally:
+        if test_temp_state.exists():
+            test_temp_state.unlink()
+
+    assert_test(
+        "TC22: Robust Unicode Decode Resilience (BOM & Replacement)",
+        read_ok is True,
+        f"(Read OK: {read_ok})",
+    )
+
+    # TC23: CrossProcessLock Reentrancy & Anti-Double-Spending Protection
+    global_gov = get_token_governor()
+    global_gov.reset("qa_challenger")
+    lock_reentrant_ok = False
+    with CrossProcessLock(global_gov._lock_file):
+        with CrossProcessLock(global_gov._lock_file):
+            lock_reentrant_ok = True
+
+    qa_budget = global_gov.get_role_budget("qa_challenger")
+    global_gov.record_usage("qa_challenger", qa_budget - 150)
+    # Payload A needs ~127 tokens (fits into 150 remaining)
+    payload_a = {
+        "toolCall": {
+            "name": "write_to_file",
+            "args": {"TargetFile": "mod_a.py", "CodeContent": "def test_a():\n    pass\n" * 20},
+        },
+        "role": "qa_challenger",
+    }
+    # Payload B needs ~127 tokens (will exceed remaining after A is recorded)
+    payload_b = {
+        "toolCall": {
+            "name": "write_to_file",
+            "args": {"TargetFile": "mod_b.py", "CodeContent": "def test_b():\n    pass\n" * 20},
+        },
+        "role": "qa_challenger",
+    }
+    res_a = evaluate_payload(payload_a)
+    res_b = evaluate_payload(payload_b)
+    anti_double_spend_ok = (
+        res_a.get("decision") == "allow"
+        and res_b.get("decision") == "deny"
+        and "vượt quá ngân sách" in res_b.get("reason", "")
+    )
+    assert_test(
+        "TC23: CrossProcessLock Reentrancy & Anti-Double-Spending Protection",
+        lock_reentrant_ok and anti_double_spend_ok,
+        f"(Reentrant: {lock_reentrant_ok}, ResA: {res_a.get('decision')}, ResB: {res_b.get('decision')})",
     )
 
     print("-" * 80)

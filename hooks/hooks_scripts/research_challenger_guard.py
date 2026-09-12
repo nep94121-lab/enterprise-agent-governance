@@ -44,7 +44,7 @@ def verify_research_critique(critique_content: str) -> tuple[bool, float, str]:
     score_match = re.search(r'(?:score|điểm|overall_score|tổng điểm)[:\s]*([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100)?', critique_content, re.IGNORECASE)
     if not score_match:
         return False, 0.0, "Could not locate numeric critique score (expected e.g. 'Score: 88/100')."
-
+    
     score = float(score_match.group(1))
     if score < 85.0:
         return False, score, f"Critique score {score}/100 is below the mandatory threshold of 85.0/100. Research rejected."
@@ -55,7 +55,7 @@ def verify_research_critique(critique_content: str) -> tuple[bool, float, str]:
     for pillar in CRITIQUE_PILLARS:
         if pillar not in content_lower:
             missing_pillars.append(pillar)
-
+    
     if len(missing_pillars) > 2:
         return False, score, f"Critique lacks coverage of essential pillars: {', '.join(missing_pillars)}"
 
@@ -69,7 +69,7 @@ def check_research_gate(workspace_dir: str) -> tuple[bool, str]:
         os.path.join(workspace_dir, "research_critique.md"),
         os.path.join(workspace_dir, "research_adversarial_critique.md"),
     ]
-
+    
     agents_dir = os.path.join(workspace_dir, ".agents")
     if os.path.exists(agents_dir):
         for root, _, files in os.walk(agents_dir):
@@ -97,21 +97,51 @@ def check_research_gate(workspace_dir: str) -> tuple[bool, str]:
     return False, f"Research gate failed. {last_reason}"
 
 def run_hook():
-    """Hook entry point for PreToolUse events"""
+    """Hook entry point for PreToolUse events with standard JSON output and verification."""
     try:
-        raw_input = sys.stdin.read()
-        if not raw_input.strip():
+        MAX_STDIN_BYTES = 10 * 1024 * 1024
+        raw_input = sys.stdin.read(MAX_STDIN_BYTES + 1)
+        if not raw_input or not raw_input.strip():
+            print(json.dumps({"decision": "ALLOW", "reason": "Empty payload"}, ensure_ascii=False))
             sys.exit(0)
-        data = json.loads(raw_input)
-    except Exception:
-        sys.exit(0)
+            
+        if len(raw_input) > MAX_STDIN_BYTES:
+            deny_msg = f"❌ [DENY]: Payload exceeds maximum limit of {MAX_STDIN_BYTES} bytes."
+            print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+            sys.exit(0)
 
-    # In standard mode, check if workspace has research gate requirements
-    sys.exit(0)
+        data = json.loads(raw_input)
+        if not isinstance(data, dict):
+            print(json.dumps({"decision": "ALLOW", "reason": "Non-object payload"}, ensure_ascii=False))
+            sys.exit(0)
+
+        tool_call = data.get("toolCall") if isinstance(data.get("toolCall"), dict) else {}
+        args = data.get("tool_args") or tool_call.get("args") or data.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+
+        target_file = args.get("TargetFile") or args.get("path") or data.get("TargetFile") or ""
+        code_content = args.get("CodeContent") or args.get("ReplacementContent") or data.get("CodeContent") or ""
+
+        # If writing or modifying an adversarial research critique file
+        if target_file and any(target_file.lower().endswith(k) for k in ("critique.md", "research_critique.md", "research_adversarial_critique.md")):
+            if code_content:
+                valid, score, msg = verify_research_critique(code_content)
+                if not valid:
+                    deny_msg = f"❌ [RESEARCH CRITIQUE REJECTED]: {msg}"
+                    print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+                    sys.exit(0)
+
+        print(json.dumps({"decision": "ALLOW", "reason": "Research challenger guard check passed"}, ensure_ascii=False))
+        sys.exit(0)
+    except Exception as exc:
+        deny_msg = f"❌ [RESEARCH CHALLENGER FAIL-CLOSED]: {exc}"
+        print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+        sys.exit(0)
 
 def self_test():
     print("=== RUNNING SELF-TEST: research_challenger_guard.py ===")
-
+    
     # Test 1: Empty critique -> FAIL
     valid, score, msg = verify_research_critique("")
     assert not valid and score == 0.0, f"Test 1 Failed: {msg}"
@@ -146,19 +176,19 @@ def self_test():
     good_critique_text = """
     # Adversarial Research Critique & Validation Report
     ## Overall Score: 92.5/100 (PASSED)
-
+    
     ### 1. Enterprise Authenticity & Zero Hallucination
     The architecture adheres strictly to Google Online Boutique and Netflix OSS.
-
+    
     ### 2. Edge Case & Chaos Resilience
     Includes Circuit Breaker half-open transitions and Saga rollback compensating steps.
-
+    
     ### 3. Scalability & Coordination Tax (Amazon STO)
     Services communicate via asynchronous events and disk contracts, eliminating meeting overhead.
-
+    
     ### 4. Hardware & OS Compatibility
-    Constrained to Windows 11 (Dynamic Host Cores & Threads (os.cpu_count())) via 3-zone CPU governor and 3-slot semaphore.
-
+    Constrained to Windows 11 (4 Cores / 8 Threads) via 3-zone CPU governor and 3-slot semaphore.
+    
     ### 5. Contract Completeness
     OpenAPI 3.0 schemas, HTTP status codes, and idempotency headers are rigorously defined.
     """

@@ -59,14 +59,47 @@ def check_fleet_health(domain_reports: list[dict]) -> tuple[bool, str, list[str]
     return True, "FLEET STATUS: HEALTHY", unhealthy_domains
 
 def run_hook():
-    """Entry point for watchdog telemetry hook"""
+    """Entry point for watchdog telemetry hook with standard JSON output."""
     try:
-        raw_input = sys.stdin.read()
-        if not raw_input.strip():
+        MAX_STDIN_BYTES = 10 * 1024 * 1024
+        raw_input = sys.stdin.read(MAX_STDIN_BYTES + 1)
+        if not raw_input or not raw_input.strip():
+            print(json.dumps({"decision": "ALLOW", "reason": "Empty payload"}, ensure_ascii=False))
             sys.exit(0)
-    except Exception:
+
+        if len(raw_input) > MAX_STDIN_BYTES:
+            deny_msg = f"❌ [DENY]: Payload exceeds maximum limit of {MAX_STDIN_BYTES} bytes."
+            print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+            sys.exit(0)
+
+        payload = json.loads(raw_input)
+        if not isinstance(payload, dict):
+            print(json.dumps({"decision": "ALLOW", "reason": "Non-object payload"}, ensure_ascii=False))
+            sys.exit(0)
+
+        # Check domain reports if available in telemetry payload
+        domain_reports = payload.get("domain_reports") or payload.get("telemetry", {}).get("domains")
+        if isinstance(domain_reports, list) and domain_reports:
+            ok, msg, degraded = check_fleet_health(domain_reports)
+            if not ok:
+                deny_msg = f"❌ [FLEET TELEMETRY ALERT]: {msg}"
+                print(json.dumps({"decision": "DENY", "reason": deny_msg, "degraded": degraded}, ensure_ascii=False))
+                sys.exit(0)
+
+        # Check local CPU telemetry
+        try:
+            cur_cpu = psutil.cpu_percent(interval=0.01)
+            zone, zone_msg = assess_cpu_zone(cur_cpu)
+            telemetry_info = {"cpu_percent": cur_cpu, "zone": zone, "zone_message": zone_msg}
+        except Exception:
+            telemetry_info = {}
+
+        print(json.dumps({"decision": "ALLOW", "reason": "Fleet health verified", "telemetry": telemetry_info}, ensure_ascii=False))
         sys.exit(0)
-    sys.exit(0)
+    except Exception as exc:
+        deny_msg = f"❌ [LEAD WATCHDOG FAIL-CLOSED]: {exc}"
+        print(json.dumps({"decision": "DENY", "reason": deny_msg}, ensure_ascii=False))
+        sys.exit(0)
 
 def self_test():
     print("=== RUNNING SELF-TEST: lead_watchdog_fleet_hook.py ===")

@@ -20,6 +20,8 @@ import os
 import pathlib
 import re
 import sys
+import unicodedata
+import urllib.parse
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -140,8 +142,12 @@ except ImportError:
         try:
             if sys.stdin.isatty():
                 return default
-            raw = sys.stdin.read()
+            max_bytes = 10 * 1024 * 1024
+            raw = sys.stdin.read(max_bytes + 1)
             if not raw or not raw.strip():
+                return default
+            if len(raw) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw)} > {max_bytes} bytes).")
                 return default
             parsed = json.loads(raw)
             return parsed if isinstance(parsed, dict) else default
@@ -161,10 +167,245 @@ except ImportError:
         return {}
 
     def normalize_path(path_str: str) -> pathlib.Path:
+        return safe_normalize_path(path_str)
+
+
+# ============================================================================
+# Security & Deobfuscation Helpers (§7-§8 Unicode Normalization & Homoglyphs)
+# ============================================================================
+
+ZERO_WIDTH_CHARS: tuple[str, ...] = (
+    "\u200b",  # zero-width space
+    "\u200c",  # zero-width non-joiner
+    "\u200d",  # zero-width joiner
+    "\ufeff",  # zero-width no-break space (BOM)
+    "\u200e",  # left-to-right mark
+    "\u200f",  # right-to-left mark
+    "\u202a",  # left-to-right embedding
+    "\u202b",  # right-to-left embedding
+    "\u202c",  # pop directional formatting
+    "\u202d",  # left-to-right override
+    "\u202e",  # right-to-left override
+    "\u2060",  # word joiner
+    "\u2061",  # function application
+    "\u2062",  # invisible times
+    "\u2063",  # invisible separator
+    "\u2064",  # invisible plus
+)
+
+HOMOGLYPH_MAP: dict[str, str] = {
+    # Cyrillic small letters
+    "\u0430": "a",  # Cyrillic a
+    "\u0431": "b",  # Cyrillic be
+    "\u0432": "b",  # Cyrillic ve
+    "\u0433": "r",  # Cyrillic ghe
+    "\u0434": "d",  # Cyrillic de
+    "\u0435": "e",  # Cyrillic ie
+    "\u0451": "e",  # Cyrillic io
+    "\u0436": "x",  # Cyrillic zhe
+    "\u0437": "z",  # Cyrillic ze
+    "\u0438": "u",  # Cyrillic i
+    "\u0439": "u",  # Cyrillic short i
+    "\u043a": "k",  # Cyrillic ka
+    "\u043b": "l",  # Cyrillic el
+    "\u043c": "m",  # Cyrillic em
+    "\u043d": "h",  # Cyrillic en
+    "\u043e": "o",  # Cyrillic o
+    "\u043f": "n",  # Cyrillic pe
+    "\u0440": "p",  # Cyrillic er
+    "\u0441": "c",  # Cyrillic es
+    "\u0442": "t",  # Cyrillic te
+    "\u0443": "y",  # Cyrillic u
+    "\u0444": "f",  # Cyrillic ef
+    "\u0445": "x",  # Cyrillic ha
+    "\u0446": "u",  # Cyrillic tse
+    "\u0447": "y",  # Cyrillic che
+    "\u0448": "w",  # Cyrillic sha
+    "\u0449": "w",  # Cyrillic shcha
+    "\u044b": "y",  # Cyrillic yeru
+    "\u044c": "b",  # Cyrillic soft sign
+    "\u044d": "e",  # Cyrillic e
+    "\u044e": "o",  # Cyrillic yu
+    "\u044f": "a",  # Cyrillic ya
+    "\u0455": "s",  # Cyrillic dze
+    "\u0456": "i",  # Cyrillic Ukrainian i
+    "\u0457": "i",  # Cyrillic Ukrainian yi
+    "\u0458": "j",  # Cyrillic je
+    "\u0501": "d",  # Cyrillic de
+    "\u051b": "q",  # Cyrillic qa
+    "\u051d": "w",  # Cyrillic we
+    # Cyrillic capital letters
+    "\u0410": "A",  # Cyrillic A
+    "\u0411": "B",  # Cyrillic Be
+    "\u0412": "B",  # Cyrillic Ve
+    "\u0413": "F",  # Cyrillic Ghe
+    "\u0414": "D",  # Cyrillic De
+    "\u0415": "E",  # Cyrillic Ie
+    "\u0401": "E",  # Cyrillic Io
+    "\u0416": "X",  # Cyrillic Zhe
+    "\u0417": "Z",  # Cyrillic Ze
+    "\u0418": "U",  # Cyrillic I
+    "\u0419": "U",  # Cyrillic Short I
+    "\u041a": "K",  # Cyrillic Ka
+    "\u041b": "L",  # Cyrillic El
+    "\u041c": "M",  # Cyrillic Em
+    "\u041d": "H",  # Cyrillic En
+    "\u041e": "O",  # Cyrillic O
+    "\u041f": "P",  # Cyrillic Pe
+    "\u0420": "P",  # Cyrillic Er
+    "\u0421": "C",  # Cyrillic Es
+    "\u0422": "T",  # Cyrillic Te
+    "\u0423": "Y",  # Cyrillic U
+    "\u0424": "O",  # Cyrillic Ef
+    "\u0425": "X",  # Cyrillic Ha
+    "\u0426": "U",  # Cyrillic Tse
+    "\u0427": "Y",  # Cyrillic Che
+    "\u0428": "W",  # Cyrillic Sha
+    "\u0429": "W",  # Cyrillic Shcha
+    "\u042b": "Y",  # Cyrillic Yeru
+    "\u042c": "B",  # Cyrillic Soft sign
+    "\u042d": "E",  # Cyrillic E
+    "\u042e": "O",  # Cyrillic Yu
+    "\u042f": "A",  # Cyrillic Ya
+    "\u0405": "S",  # Cyrillic Dze
+    "\u0406": "I",  # Cyrillic Ukrainian I
+    "\u0407": "I",  # Cyrillic Ukrainian Yi
+    "\u0408": "J",  # Cyrillic Je
+    # Greek lowercase letters
+    "\u03b1": "a",  # alpha
+    "\u03b2": "b",  # beta
+    "\u03b3": "y",  # gamma
+    "\u03b4": "d",  # delta
+    "\u03b5": "e",  # epsilon
+    "\u03b6": "z",  # zeta
+    "\u03b7": "n",  # eta
+    "\u03b8": "o",  # theta
+    "\u03b9": "i",  # iota
+    "\u03ba": "k",  # kappa
+    "\u03bb": "l",  # lambda
+    "\u03bc": "u",  # mu
+    "\u03bd": "v",  # nu
+    "\u03be": "x",  # xi
+    "\u03bf": "o",  # omicron
+    "\u03c0": "n",  # pi
+    "\u03c1": "p",  # rho
+    "\u03c3": "o",  # sigma
+    "\u03c4": "t",  # tau
+    "\u03c5": "u",  # upsilon
+    "\u03c6": "o",  # phi
+    "\u03c7": "x",  # chi
+    "\u03c8": "y",  # psi
+    "\u03c9": "w",  # omega
+    # Greek uppercase letters
+    "\u0391": "A",  # Alpha
+    "\u0392": "B",  # Beta
+    "\u0393": "r",  # Gamma
+    "\u0394": "D",  # Delta
+    "\u0395": "E",  # Epsilon
+    "\u0396": "Z",  # Zeta
+    "\u0397": "H",  # Eta
+    "\u0398": "O",  # Theta
+    "\u0399": "I",  # Iota
+    "\u039a": "K",  # Kappa
+    "\u039b": "L",  # Lambda
+    "\u039c": "M",  # Mu
+    "\u039d": "N",  # Nu
+    "\u039e": "E",  # Xi
+    "\u039f": "O",  # Omicron
+    "\u03a0": "P",  # Pi
+    "\u03a1": "P",  # Rho
+    "\u03a3": "E",  # Sigma
+    "\u03a4": "T",  # Tau
+    "\u03a5": "Y",  # Upsilon
+    "\u03a6": "O",  # Phi
+    "\u03a7": "X",  # Chi
+    "\u03a8": "Y",  # Psi
+    "\u03a9": "O",  # Omega
+}
+
+
+def filter_homoglyphs(text: str) -> str:
+    """Normalize Unicode (NFKC), strip zero-width characters, and map homoglyphs to ASCII equivalents."""
+    if not isinstance(text, str) or not text:
+        return ""
+    # 1. NFKC normalization (handles fullwidth, compatibility chars, math fonts)
+    norm = unicodedata.normalize("NFKC", text)
+    # 2. Strip zero-width & invisible characters
+    for zw in ZERO_WIDTH_CHARS:
+        norm = norm.replace(zw, "")
+    # 3. Map homoglyphs
+    return "".join(HOMOGLYPH_MAP.get(ch, ch) for ch in norm)
+
+
+def decode_multilayer_path(raw_path: str, max_rounds: int = 5) -> str:
+    """Recursively decode percent-encoding, escape sequences, and normalize Unicode path."""
+    if not isinstance(raw_path, str) or not raw_path:
+        return ""
+
+    decoded = raw_path
+    # 1. Multi-layer URL / percent-decoding (e.g. %252f -> %2f -> /)
+    for _ in range(max_rounds):
         try:
-            return pathlib.Path(path_str).resolve()
+            new_decoded = urllib.parse.unquote(decoded)
         except Exception:
-            return pathlib.Path(path_str)
+            break
+        if new_decoded == decoded:
+            break
+        decoded = new_decoded
+
+    # 2. Hex (\xXX) and Unicode (\uXXXX) escapes safe decode
+    def _repl_hex(m: re.Match[str]) -> str:
+        try:
+            return chr(int(m.group(1), 16))
+        except (ValueError, OverflowError):
+            return m.group(0)
+
+    try:
+        decoded = re.sub(r"\\u([0-9a-fA-F]{4})", _repl_hex, decoded)
+        decoded = re.sub(r"\\x([0-9a-fA-F]{2})", _repl_hex, decoded)
+    except Exception:
+        pass
+
+    # 3. Unicode NFKC normalization (handles fullwidth characters like ／ U+FF0F, ＼ U+FF3C)
+    decoded = unicodedata.normalize("NFKC", decoded)
+
+    # 4. Strip zero-width and invisible directional markers
+    for zw in ZERO_WIDTH_CHARS:
+        decoded = decoded.replace(zw, "")
+
+    # 5. Normalize fullwidth slashes and backslashes
+    decoded = decoded.replace("\uff0f", "/").replace("\uff3c", "\\")
+
+    return decoded
+
+
+def safe_normalize_path(path_input: str | pathlib.Path) -> pathlib.Path:
+    """Safely decode multi-layer path string and resolve to canonical pathlib.Path."""
+    if isinstance(path_input, pathlib.Path):
+        path_str = str(path_input)
+    else:
+        path_str = str(path_input or "")
+
+    decoded_str = decode_multilayer_path(path_str)
+    try:
+        return pathlib.Path(decoded_str).resolve()
+    except Exception:
+        return pathlib.Path(decoded_str)
+
+
+# Ensure safe_normalize_path is used globally across the module
+normalize_path = safe_normalize_path
+
+
+def canonical_tag_name(name: str) -> str:
+    """Normalize tag name for symmetric comparison (NFKC + homoglyphs + zero-width strip)."""
+    if not isinstance(name, str) or not name:
+        return ""
+    norm = unicodedata.normalize("NFKC", name)
+    for zw in ZERO_WIDTH_CHARS:
+        norm = norm.replace(zw, "")
+    norm = filter_homoglyphs(norm)
+    return norm.strip()
 
 
 def has_stdin_data() -> bool:
@@ -461,6 +702,7 @@ def build_rule_file_schema(allowed_roles: list[str] | None = None) -> dict[str, 
     return {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
+        "additionalProperties": False,
         "required": ["role", "sections"],
         "properties": {
             "role": {
@@ -472,11 +714,12 @@ def build_rule_file_schema(allowed_roles: list[str] | None = None) -> dict[str, 
                 "type": "array",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "required": ["name", "content"],
                     "properties": {
                         "name": {
                             "type": "string",
-                            "pattern": "^[a-zA-Z0-9_\\[\\]\\-\\.\\:]+$",
+                            "pattern": "^[^\\s/<>]+$",
                             "description": "Section identifier",
                         },
                         "content": {
@@ -486,6 +729,7 @@ def build_rule_file_schema(allowed_roles: list[str] | None = None) -> dict[str, 
                         },
                         "metadata": {
                             "type": "object",
+                            "additionalProperties": True,
                             "properties": {
                                 "priority": {"type": "integer", "minimum": 1, "maximum": 10},
                                 "tags": {"type": "array", "items": {"type": "string"}},
@@ -525,7 +769,7 @@ REQUIRED_SECTIONS: dict[RuleCategory | str, list[str]] = {
     RuleCategory.DEVOPS_SECURITY: ["deployment_security", "monitoring"],
 }
 
-SECTION_NAMING_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\[\]\.\:\\]+$")
+SECTION_NAMING_PATTERN = re.compile(r"^[\w\-\[\]\.\:\\]+$", re.UNICODE)
 
 
 # ============================================================================
@@ -657,99 +901,109 @@ class RuleSchemaValidator:
         return sections, remainder, closing_idx + 1
 
     def _parse_xml_sections(self, content: str) -> list[FrontmatterSection]:
-        """Parse XML-like tags with multi-line and single-line resilience."""
+        """Parse XML-like tags with multi-line and single-line resilience,
+        immune to homoglyphs, fullwidth brackets, and asymmetric Unicode normalizations.
+        """
         sections: list[FrontmatterSection] = []
         lines = content.splitlines()
 
         tag_open_re = re.compile(
-            r"<([a-zA-Z0-9_\-\[\]\.\:\\]+)(?:\s+([^>]*?))?(?:\s*(/)>|>)"
+            r"<([^!\?\s>/<][^\s>/<]*?)(?:\s+([^>]*?))?(?:\s*(/)>|>)",
+            re.UNICODE,
         )
-        tag_close_re = re.compile(r"</([a-zA-Z0-9_\-\[\]\.\:\\]+)>")
-        single_line_re = re.compile(
-            r"<([a-zA-Z0-9_\-\[\]\.\:\\]+)(?:\s+([^>]*?))?>(.*?)</\1>"
-        )
+        tag_close_re = re.compile(r"</([^!\?\s>/<][^\s>/<]*?)>", re.UNICODE)
 
         current_name: str | None = None
+        current_canonical_name: str | None = None
         current_start: int = 0
         current_meta: dict[str, Any] = {}
         buffer: list[str] = []
 
         for line_num, line in enumerate(lines, start=1):
-            stripped = line.strip()
+            normalized_line = line.replace("\uff1c", "<").replace("\uff1e", ">")
+            stripped = normalized_line.strip()
 
-            # Check single-line complete tag: <tag>content</tag>
-            sl_match = single_line_re.match(stripped)
-            if sl_match and current_name is None:
-                tag_name = sl_match.group(1)
-                attr_str = sl_match.group(2) or ""
-                body = sl_match.group(3).strip()
-                sections.append(
-                    FrontmatterSection(
-                        name=tag_name,
-                        content=body,
-                        start_line=line_num,
-                        end_line=line_num,
-                        metadata=self._parse_section_attributes(attr_str),
-                    )
-                )
+            # Ignore HTML comments and XML directives outside sections
+            if stripped.startswith("<!--") or stripped.startswith("<!") or stripped.startswith("<?"):
+                if current_name is not None:
+                    buffer.append(line)
                 continue
 
-            # Check opening tag
-            op_match = tag_open_re.match(stripped)
-            if op_match and current_name is None:
-                tag_name = op_match.group(1)
-                attr_str = op_match.group(2) or ""
-                is_self_closing = bool(op_match.group(3))
+            # Check for opening tags if not currently in a multi-line section
+            if current_name is None:
+                op_match = tag_open_re.match(stripped)
+                if op_match:
+                    raw_tag_name = op_match.group(1)
+                    canon_tag_name = canonical_tag_name(raw_tag_name)
+                    attr_str = op_match.group(2) or ""
+                    is_self_closing = bool(op_match.group(3))
 
-                if is_self_closing:
-                    sections.append(
-                        FrontmatterSection(
-                            name=tag_name,
-                            content="",
-                            start_line=line_num,
-                            end_line=line_num,
-                            metadata=self._parse_section_attributes(attr_str),
+                    if is_self_closing:
+                        sections.append(
+                            FrontmatterSection(
+                                name=canon_tag_name,
+                                content="",
+                                start_line=line_num,
+                                end_line=line_num,
+                                metadata=self._parse_section_attributes(attr_str),
+                            )
                         )
-                    )
-                    continue
+                        continue
 
-                # Check if closing tag exists later in the same line
-                close_suffix = f"</{tag_name}>"
-                if close_suffix in stripped:
-                    inner = stripped[op_match.end():stripped.rfind(close_suffix)].strip()
-                    sections.append(
-                        FrontmatterSection(
-                            name=tag_name,
-                            content=inner,
-                            start_line=line_num,
-                            end_line=line_num,
-                            metadata=self._parse_section_attributes(attr_str),
-                        )
-                    )
-                    continue
+                    # Check if matching closing tag exists on the same line
+                    after_open = stripped[op_match.end():]
+                    single_line_found = False
+                    for cl_m in tag_close_re.finditer(after_open):
+                        if canonical_tag_name(cl_m.group(1)) == canon_tag_name:
+                            inner = after_open[:cl_m.start()].strip()
+                            sections.append(
+                                FrontmatterSection(
+                                    name=canon_tag_name,
+                                    content=inner,
+                                    start_line=line_num,
+                                    end_line=line_num,
+                                    metadata=self._parse_section_attributes(attr_str),
+                                )
+                            )
+                            single_line_found = True
+                            break
 
-                current_name = tag_name
-                current_start = line_num
-                current_meta = self._parse_section_attributes(attr_str)
-                buffer = []
-                continue
+                    if single_line_found:
+                        continue
 
-            # Check closing tag for current section
-            if current_name is not None:
-                cl_match = tag_close_re.search(stripped)
-                if cl_match and cl_match.group(1) == current_name:
-                    sections.append(
-                        FrontmatterSection(
-                            name=current_name,
-                            content="\n".join(buffer).strip(),
-                            start_line=current_start,
-                            end_line=line_num,
-                            metadata=current_meta,
-                        )
-                    )
-                    current_name = None
+                    current_name = canon_tag_name
+                    current_canonical_name = canon_tag_name
+                    current_start = line_num
+                    current_meta = self._parse_section_attributes(attr_str)
                     buffer = []
                     continue
+
+            # Inside multi-line section: search for symmetric closing tag
+            if current_name is not None and current_canonical_name is not None:
+                matched_close = False
+                for cl_match in tag_close_re.finditer(stripped):
+                    if canonical_tag_name(cl_match.group(1)) == current_canonical_name:
+                        pre_close = stripped[:cl_match.start()].strip()
+                        if pre_close:
+                            buffer.append(pre_close)
+                        sections.append(
+                            FrontmatterSection(
+                                name=current_name,
+                                content="\n".join(buffer).strip(),
+                                start_line=current_start,
+                                end_line=line_num,
+                                metadata=current_meta,
+                            )
+                        )
+                        current_name = None
+                        current_canonical_name = None
+                        buffer = []
+                        matched_close = True
+                        break
+
+                if matched_close:
+                    continue
+
                 buffer.append(line)
 
         # If file ends without closing tag, close gracefully
@@ -767,9 +1021,9 @@ class RuleSchemaValidator:
         return sections
 
     def _parse_markdown_headings(self, content: str) -> list[FrontmatterSection]:
-        """Extract sections from Markdown headings (## and ###) when no XML tags are used."""
-        import unicodedata
-
+        """Extract sections from Markdown headings (## and ###) when no XML tags are used.
+        Applies non-destructive Unicode normalization preserving Vietnamese and international titles.
+        """
         sections: list[FrontmatterSection] = []
         lines = content.splitlines()
         heading_re = re.compile(r"^(#{2,3})\s+(.+)$")
@@ -793,12 +1047,29 @@ class RuleSchemaValidator:
                         )
                     )
                 raw_title = m.group(2).strip()
-                # Transliterate Unicode accents to ASCII for clean snake_case slug
-                norm_title = unicodedata.normalize("NFKD", raw_title).encode("ascii", "ignore").decode("ascii")
-                clean_name = re.sub(r"[^\w\s-]", "", norm_title).strip().lower()
-                clean_name = re.sub(r"[-\s]+", "_", clean_name)
-                # Strip leading non-alphabetic characters (including leading underscores)
-                clean_name = re.sub(r"^[^a-z]+", "", clean_name)
+                # Non-destructive Unicode normalization
+                # 1. Normalize with NFKC to compose compatible forms while preserving international characters
+                norm_title = unicodedata.normalize("NFKC", raw_title)
+
+                # 2. Try an ASCII slug first if possible (by removing diacritics via NFKD decomposition of combining chars)
+                decomposed = unicodedata.normalize("NFKD", norm_title)
+                ascii_attempt = "".join(
+                    c for c in decomposed if not unicodedata.combining(c) and ord(c) < 128
+                )
+                ascii_clean = re.sub(r"[^\w\s-]", "", ascii_attempt).strip().lower()
+                ascii_clean = re.sub(r"[-\s]+", "_", ascii_clean).strip("_")
+                ascii_clean = re.sub(r"^[0-9_.\-]+", "", ascii_clean)
+                ascii_clean = re.sub(r"^[^a-z0-9]+", "", ascii_clean)
+
+                if ascii_clean and len(ascii_clean) >= 2:
+                    clean_name = ascii_clean
+                else:
+                    # Non-destructive fallback for non-Latin scripts (Cyrillic, CJK, Arabic, etc.)
+                    # Preserve all Unicode word characters (\w)
+                    unicode_clean = re.sub(r"[^\w\s-]", "", norm_title, flags=re.UNICODE).strip().lower()
+                    unicode_clean = re.sub(r"[-\s]+", "_", unicode_clean).strip("_")
+                    clean_name = unicode_clean
+
                 current_name = clean_name or f"section_{line_num}"
                 current_start = line_num
                 buffer = []
@@ -816,7 +1087,6 @@ class RuleSchemaValidator:
                     end_line=len(lines),
                 )
             )
-
         return sections
 
     def _parse_section_attributes(self, attrs_str: str) -> dict[str, Any]:
@@ -850,18 +1120,21 @@ class RuleSchemaValidator:
     # ------------------------------------------------------------------------
 
     def _infer_role_from_path(self, file_path: str, content: str = "") -> str:
-        """Infer the role dynamically from path parts, filename, or content."""
-        path = pathlib.Path(file_path)
+        """Infer the role dynamically from path parts, filename, or content.
+        Applies multi-layer decoding, Unicode normalization, and homoglyph filtering.
+        """
+        decoded_path_str = decode_multilayer_path(file_path)
+        path = pathlib.Path(decoded_path_str)
         valid_roles = self._valid_roles
 
         # 1. Check directory path parts
         for part in path.parts:
-            low_part = part.lower()
+            low_part = filter_homoglyphs(part).lower()
             if low_part in valid_roles:
                 return low_part
 
         # 2. Check filename prefix/stem
-        stem = path.stem.lower()
+        stem = filter_homoglyphs(path.stem).lower()
         role_prefixes = {
             "backend": "backend_developer",
             "frontend": "frontend_developer",
@@ -893,11 +1166,12 @@ class RuleSchemaValidator:
 
         # 3. Content inspection for role header or frontmatter
         if content:
+            norm_content = filter_homoglyphs(unicodedata.normalize("NFKC", content))
             for role_name in valid_roles:
-                if re.search(rf"\b{re.escape(role_name)}\b", content, re.IGNORECASE):
+                if re.search(rf"\b{re.escape(role_name)}\b", norm_content, re.IGNORECASE):
                     return role_name
             # Check uppercase Vietnamese/English role markers
-            content_upper = content.upper()
+            content_upper = norm_content.upper()
             if "BACKEND DEVELOPER" in content_upper or "BACKEND_DEVELOPER" in content_upper:
                 return "backend_developer"
             if "FRONTEND DEVELOPER" in content_upper or "FRONTEND_DEVELOPER" in content_upper:
@@ -935,7 +1209,7 @@ class RuleSchemaValidator:
 
     def parse_rule_file(self, file_path: str | pathlib.Path) -> ParsedRule:
         """Parse rule file of any supported format (.md, .yaml, .json)."""
-        path = pathlib.Path(file_path).resolve()
+        path = safe_normalize_path(file_path)
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Rule file not found: {file_path}")
 
@@ -944,6 +1218,9 @@ class RuleSchemaValidator:
                 content = f.read()
         except OSError as exc:
             raise OSError(f"Error reading {path}: {exc}") from exc
+
+        # Canonical Unicode normalization (NFC)
+        content = unicodedata.normalize("NFC", content)
 
         ext = path.suffix.lower()
 
@@ -1080,11 +1357,15 @@ class RuleSchemaValidator:
         return errors
 
     def validate_section_content(self, section: FrontmatterSection) -> list[ValidationError]:
-        """Validate section content length and hygiene."""
+        """Validate section content length and hygiene.
+        Employs canonical NFC normalization for precise grapheme/character measurement
+        and deobfuscated homoglyph filtering to detect evasive TODO/FIXME markers.
+        """
         errors: list[ValidationError] = []
         max_len = int(self._config.get("max_section_length", 10000))
 
-        if not section.content or not section.content.strip():
+        raw_content = section.content or ""
+        if not raw_content.strip():
             errors.append(
                 ValidationError(
                     severity=ValidationSeverity.WARNING,
@@ -1094,7 +1375,12 @@ class RuleSchemaValidator:
                 )
             )
 
-        if "TODO" in section.content or "FIXME" in section.content:
+        # Canonical NFC normalization for consistent character/grapheme count
+        norm_content = unicodedata.normalize("NFC", raw_content)
+
+        # Deobfuscated homoglyph & fullwidth keyword checking for TODO / FIXME
+        deobf_content = filter_homoglyphs(norm_content).upper()
+        if re.search(r"\bTODO\b", deobf_content) or re.search(r"\bFIXME\b", deobf_content) or "TODO" in deobf_content or "FIXME" in deobf_content:
             errors.append(
                 ValidationError(
                     severity=ValidationSeverity.INFO,
@@ -1104,11 +1390,13 @@ class RuleSchemaValidator:
                 )
             )
 
-        if len(section.content) > max_len:
+        # Measure canonical NFC character length to prevent NFD decomposed expansion discrepancy
+        actual_len = len(norm_content)
+        if actual_len > max_len:
             errors.append(
                 ValidationError(
                     severity=ValidationSeverity.WARNING,
-                    message=f"Section '{section.name}' has very long content ({len(section.content)} chars > {max_len}). Consider splitting.",
+                    message=f"Section '{section.name}' has very long content ({actual_len} chars > {max_len}). Consider splitting.",
                     section=section.name,
                     line_number=section.start_line,
                 )
@@ -1151,8 +1439,23 @@ class RuleSchemaValidator:
             )
             return result
 
-        # 3. Validate each section
+        # 3. Validate each section and detect duplicate section identifiers
+        seen_section_names: set[str] = set()
         for section in rule.sections:
+            sec_norm = str(section.name).strip().lower()
+            if sec_norm in seen_section_names:
+                result.add_error(
+                    ValidationError(
+                        severity=ValidationSeverity.ERROR,
+                        message=f"Duplicate section identifier '{section.name}' detected in rule file",
+                        file_path=rule.file_path,
+                        section=section.name,
+                        line_number=section.start_line,
+                    )
+                )
+            else:
+                seen_section_names.add(sec_norm)
+
             for err in self.validate_section_name(section.name):
                 err.file_path = rule.file_path
                 err.line_number = section.start_line
@@ -1216,6 +1519,19 @@ class RuleSchemaValidator:
                             field=prop,
                         )
                     )
+
+            if not self._schema.get("additionalProperties", True):
+                allowed_props = set(self._schema.get("properties", {}).keys())
+                for k in rule_dict:
+                    if k not in allowed_props:
+                        result.add_error(
+                            ValidationError(
+                                severity=ValidationSeverity.ERROR,
+                                message=f"Unexpected property '{k}' not allowed by schema (additionalProperties=false)",
+                                file_path=rule.file_path,
+                                field=k,
+                            )
+                        )
 
     def _check_required_sections(self, rule: ParsedRule, result: ValidationResult) -> None:
         """Check for recommended / required sections per role and file type."""
@@ -1422,33 +1738,52 @@ class ErrorReporter:
 # Hook Handler (PostToolUse)
 # ============================================================================
 
-def is_rule_file_candidate(target_path: pathlib.Path) -> bool:
-    """Determine if a target file path should trigger rule schema validation."""
+def is_rule_file_candidate(target_path: pathlib.Path | str) -> bool:
+    """Determine if a target file path should trigger rule schema validation.
+
+    Applies multi-layer decoding, Unicode normalization (NFKC), homoglyph filtering,
+    and zero-width stripping to eliminate blindspots and evasion.
+    """
+    if isinstance(target_path, str):
+        target_path = safe_normalize_path(target_path)
+    elif isinstance(target_path, pathlib.Path):
+        target_path = safe_normalize_path(str(target_path))
+
     if target_path.exists() and not target_path.is_file():
         return False
 
-    ext = target_path.suffix.lower()
-    if ext not in (".md", ".yaml", ".yml", ".json"):
-        return False
+    path_str = str(target_path)
+    decoded_path_str = decode_multilayer_path(path_str)
+    filtered_path_str = filter_homoglyphs(decoded_path_str)
+    norm_str = filtered_path_str.replace("\\", "/").lower()
 
-    name = target_path.name.lower()
-    if name.startswith("_") or name == "readme.md":
+    name = pathlib.Path(decoded_path_str).name
+    norm_name = filter_homoglyphs(name).lower()
+
+    valid_extensions = (".md", ".yaml", ".yml", ".json")
+    has_valid_ext = any(norm_name.endswith(ext) for ext in valid_extensions)
+    if not has_valid_ext:
+        suffix_norm = filter_homoglyphs(target_path.suffix).lower()
+        if suffix_norm not in valid_extensions:
+            return False
+
+    if norm_name.startswith("_") or norm_name == "readme.md":
         return False
 
     # Check if inside a known rules directory
-    norm_str = str(target_path).replace("\\", "/").lower()
     if "/rules_by_role/" in norm_str or "/config/rules/" in norm_str or "/rules/" in norm_str:
         return True
 
     # Check if filename implies rules
-    if "rule" in name:
+    if "rule" in norm_name:
         return True
 
     # Quick peek at file content for rule directives if file exists on disk
     if target_path.is_file():
         try:
-            sample = target_path.read_text(encoding="utf-8-sig", errors="ignore")[:500]
-            if "<enforced_turn_1_gate>" in sample or "CANARY_VERIFIED" in sample:
+            sample = target_path.read_text(encoding="utf-8-sig", errors="ignore")[:1000]
+            norm_sample = filter_homoglyphs(unicodedata.normalize("NFKC", sample))
+            if "<enforced_turn_1_gate>" in norm_sample or "CANARY_VERIFIED" in norm_sample or "<rule" in norm_sample:
                 return True
         except Exception:
             pass
@@ -1457,7 +1792,7 @@ def is_rule_file_candidate(target_path: pathlib.Path) -> bool:
 
 
 def evaluate_hook(payload: dict[str, Any]) -> dict[str, Any]:
-    """Execute PostToolUse hook on modified files."""
+    """Execute PostToolUse hook on modified files with multi-layer decoding and normalization."""
     tool_call = get_tool_call(payload)
     args = get_tool_args(tool_call)
 
@@ -1471,7 +1806,7 @@ def evaluate_hook(payload: dict[str, Any]) -> dict[str, Any]:
     if not raw_target or not isinstance(raw_target, str):
         return post_tool_response()
 
-    target_path = normalize_path(raw_target)
+    target_path = safe_normalize_path(raw_target)
     if not is_rule_file_candidate(target_path):
         return post_tool_response()
 
@@ -1501,7 +1836,7 @@ def run_self_test() -> int:
     print("\n[SELF-TEST] Universal Multi-Agent Governance Kit — Rule Schema Validator")
     print("=" * 70)
     passed = 0
-    total = 8
+    total = 16
 
     # Test 1: XML Section Parsing (single-line & multi-line)
     val = RuleSchemaValidator()
@@ -1603,7 +1938,99 @@ Content of second section.
     assert len(dir_results) > 0, "No rule files found in rules_by_role directory"
     failed_files = [p for p, r in dir_results.items() if not r.valid]
     assert len(failed_files) == 0, f"Found validation failures in real rules: {failed_files}"
-    print(f"  [8/8] Live rules_by_role Batch Validation ({len(dir_results)} files): PASS (0 Failures)")
+    print(f"  [8/16] Live rules_by_role Batch Validation ({len(dir_results)} files): PASS (0 Failures)")
+    passed += 1
+
+    # Test 9: Multi-Layer / Double-Decoding Path Processing
+    decoded = decode_multilayer_path("rules_by_role%252fbackend_developer%252fBACKEND_RULES.md")
+    assert "/" in decoded, f"Expected decoded slashes, got: {decoded}"
+    assert "%25" not in decoded and "%2f" not in decoded
+    esc_decoded = decode_multilayer_path("rules_by_role\\x2fbackend_developer\\u002fBACKEND_RULES.md")
+    assert "/" in esc_decoded, f"Expected decoded escape slashes, got: {esc_decoded}"
+    fw_decoded = decode_multilayer_path("rules_by_role\uff0fbackend_developer\uff0fBACKEND_RULES.md")
+    assert "/" in fw_decoded, f"Expected normalized fullwidth slashes, got: {fw_decoded}"
+    print("  [9/16] Multi-Layer & Double-Decoding Path Processing: PASS")
+    passed += 1
+
+    # Test 10: Candidate File Homoglyphs & Evasion Filtering
+    assert is_rule_file_candidate("rules_by_role%252fbackend_developer%252fBACKEND_RULES.md")
+    assert is_rule_file_candidate("rules_by_role\uff0fbackend_developer\uff0fBACKEND_RULES.md")
+    assert is_rule_file_candidate("rul\u0435s_by_rol\u0435/backend_developer/BACKEND_RULES.md")
+    assert is_rule_file_candidate("custom/path/BACKEND_RULES\uff0emd")  # fullwidth dot
+    print("  [10/16] Candidate Homoglyph & Deobfuscation Precision: PASS")
+    passed += 1
+
+    # Test 11: Canonical Unicode Normalization (NFC)
+    decomposed_content = "role: backend_developer\ntitle: Re\u0301glement\n"
+    composed_content = unicodedata.normalize("NFC", decomposed_content)
+    assert composed_content != decomposed_content
+    assert "\u00e9" in composed_content
+    print("  [11/16] Canonical Unicode Normalization (NFC): PASS")
+    passed += 1
+
+    # Test 12: XML Tag Parser with Fullwidth Brackets & Homoglyphs
+    homoglyph_xml = """
+＜enforced_turn_1_g\u0430te priority="10"＞
+Canary and gate instructions
+＜/enforced_turn_1_g\u0430te＞
+
+＜section_two＞
+Section two content
+＜/section_two＞
+"""
+    sections_xml_homo = val.parse_frontmatter(homoglyph_xml)
+    assert len(sections_xml_homo) == 2, f"Expected 2 sections from fullwidth/homoglyph XML, got {len(sections_xml_homo)}"
+    assert sections_xml_homo[0].name == "enforced_turn_1_gate"
+    assert "Canary and gate" in sections_xml_homo[0].content
+    print("  [12/16] XML Tag Parser Fullwidth Brackets & Homoglyphs: PASS")
+    passed += 1
+
+    # Test 13: Asymmetric Unicode Normalization (NFC vs NFD) XML Delimiters
+    asymmetric_xml = "<regle_\u00e9>\nContent of section\n</regle_e\u0301>\n<next_section>\nNext content\n</next_section>"
+    sections_asym = val.parse_frontmatter(asymmetric_xml)
+    assert len(sections_asym) == 2, f"Expected 2 sections from asymmetric NFC/NFD delimiters, got {len(sections_asym)}"
+    assert sections_asym[0].content == "Content of section"
+    assert sections_asym[1].name == "next_section"
+    print("  [13/16] Symmetric XML Tag Delimiter Matching (NFC vs NFD): PASS")
+    passed += 1
+
+    # Test 14: Non-Destructive Markdown Heading Normalization
+    intl_md = """# Multi-lingual Rules
+> International
+
+## Tiêu chuẩn kỹ thuật
+Vietnamese content.
+
+## Общие правила
+Russian content.
+
+## 技術標準
+Japanese content.
+"""
+    sections_intl = val.parse_frontmatter(intl_md)
+    assert len(sections_intl) == 3, f"Expected 3 sections, got {len(sections_intl)}"
+    assert sections_intl[0].name == "tieu_chuan_ky_thuat"
+    assert sections_intl[1].name == "общие_правила"
+    assert sections_intl[2].name == "技術標準"
+    print("  [14/16] Non-Destructive Heading Normalization (Vietnamese/CJK/Cyrillic): PASS")
+    passed += 1
+
+    # Test 15: Multi-Layer Role Inference & Homoglyphs
+    role_inferred_1 = val._infer_role_from_path("rules_by_role%252fb\u0430ckend_developer%252fBACKEND_RULES.md")
+    assert role_inferred_1 == "backend_developer", f"Expected backend_developer, got {role_inferred_1}"
+    role_inferred_2 = val._infer_role_from_path("path/to/rule.md", content="Role: B\u0410CKEND DEVELOPER")
+    assert role_inferred_2 == "backend_developer", f"Expected backend_developer, got {role_inferred_2}"
+    print("  [15/16] Multi-Layer & Homoglyph Role Inference: PASS")
+    passed += 1
+
+    # Test 16: Grapheme Cluster Discrepancy & Homoglyph TODO/FIXME Detection
+    sec_todo_1 = FrontmatterSection(name="test_todo_1", content="Work in progress: ＴＯＤＯ finish this", start_line=1, end_line=5)
+    sec_todo_2 = FrontmatterSection(name="test_todo_2", content="Refactor: \u0422\u200b\u041eDO later", start_line=1, end_line=5)
+    sec_fixme = FrontmatterSection(name="test_fixme", content="Bug: F\u0406XME immediately", start_line=1, end_line=5)
+    assert any("TODO/FIXME" in err.message for err in val.validate_section_content(sec_todo_1))
+    assert any("TODO/FIXME" in err.message for err in val.validate_section_content(sec_todo_2))
+    assert any("TODO/FIXME" in err.message for err in val.validate_section_content(sec_fixme))
+    print("  [16/16] Grapheme Measurement & Homoglyph TODO/FIXME Detection: PASS")
     passed += 1
 
     print("=" * 70)

@@ -1379,8 +1379,11 @@ if __name__ == "__main__":
     # Hook mode: when invoked via Antigravity stdin pipeline or --hook
     if "--hook" in sys.argv or not sys.stdin.isatty():
         try:
-            raw_input = sys.stdin.read()
-            if raw_input and raw_input.strip():
+            max_bytes = 10 * 1024 * 1024
+            raw_input = sys.stdin.read(max_bytes + 1)
+            if len(raw_input) > max_bytes:
+                sys.stderr.write(f"[PARALLEL-REVIEW] Payload exceeds {max_bytes} bytes\n")
+            elif raw_input and raw_input.strip():
                 payload = json.loads(raw_input)
                 tool_call = payload.get("toolCall", {}) if isinstance(payload, dict) else {}
                 args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}

@@ -73,14 +73,53 @@ def verify_handoff_artifact(handoff_content: str) -> tuple[bool, list[str]]:
     return len(missing) == 0, missing
 
 def run_hook():
-    """Hook entry point"""
+    """Hook entry point with standard JSON output and multi-auditor consensus verification."""
     try:
-        raw_input = sys.stdin.read()
-        if not raw_input.strip():
+        MAX_STDIN_BYTES = 10 * 1024 * 1024
+        raw_input = sys.stdin.read(MAX_STDIN_BYTES + 1)
+        if not raw_input or not raw_input.strip():
+            print(json.dumps({"decision": "ALLOW", "reason": "Empty payload"}, ensure_ascii=False))
             sys.exit(0)
-    except Exception:
+
+        if len(raw_input) > MAX_STDIN_BYTES:
+            deny_msg = f"❌ [DENY]: Payload exceeds maximum limit of {MAX_STDIN_BYTES} bytes."
+            print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+            sys.exit(0)
+
+        data = json.loads(raw_input)
+        if not isinstance(data, dict):
+            print(json.dumps({"decision": "ALLOW", "reason": "Non-object payload"}, ensure_ascii=False))
+            sys.exit(0)
+
+        tool_call = data.get("toolCall") if isinstance(data.get("toolCall"), dict) else {}
+        args = data.get("tool_args") or tool_call.get("args") or data.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+
+        target_file = args.get("TargetFile") or args.get("path") or data.get("TargetFile") or ""
+        code_content = args.get("CodeContent") or args.get("ReplacementContent") or data.get("CodeContent") or ""
+
+        target_lower = target_file.lower()
+        if "handoff.md" in target_lower and code_content:
+            ok, missing = verify_handoff_artifact(code_content)
+            if not ok:
+                deny_msg = f"❌ [HANDOFF REJECTED]: Missing mandatory sections: {', '.join(missing)}"
+                print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+                sys.exit(0)
+
+        if any(k in target_lower for k in ("multi_auditor", "panel_review", "audit_consensus")) and code_content:
+            ok, score, blockers, msg = verify_multi_auditor_panel(code_content)
+            if not ok:
+                deny_msg = f"❌ [AUDITOR PANEL REJECTED]: {msg}"
+                print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+                sys.exit(0)
+
+        print(json.dumps({"decision": "ALLOW", "reason": "Multi-auditor consensus verified"}, ensure_ascii=False))
         sys.exit(0)
-    sys.exit(0)
+    except Exception as exc:
+        deny_msg = f"❌ [MULTI AUDITOR FAIL-CLOSED]: {exc}"
+        print(json.dumps({"decision": "DENY", "reason": deny_msg}, ensure_ascii=False))
+        sys.exit(0)
 
 def self_test():
     print("=== RUNNING SELF-TEST: multi_auditor_consensus_guard.py ===")

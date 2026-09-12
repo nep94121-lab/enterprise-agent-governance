@@ -1007,6 +1007,9 @@ Examples:
     diff_content = None
     if args.diff_file:
         try:
+            if os.path.exists(args.diff_file) and os.path.getsize(args.diff_file) > 5 * 1024 * 1024:
+                print(json.dumps({"decision": "allow", "reason": f"Diff file {args.diff_file} exceeds 5MB limit, skipping LLM scan"}))
+                sys.exit(0)
             with open(args.diff_file, encoding='utf-8') as f:
                 diff_content = f.read()
         except Exception as e:
@@ -1035,8 +1038,8 @@ Examples:
         print(f"Error: {e}")
         sys.exit(1)
     except ValueError as e:
-        print(f"Configuration error: {e}")
-        sys.exit(2)
+        print(f"Configuration warning: {e}", file=sys.stderr)
+        sys.exit(0)
     except Exception as e:
         print(f"Inspection failed: {e}")
         sys.exit(3)

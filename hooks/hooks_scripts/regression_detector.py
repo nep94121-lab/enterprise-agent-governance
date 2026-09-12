@@ -3,13 +3,17 @@
 
 Provides physical runtime regression detection and baseline verification:
 1. Cryptographic Snapshot Manifest: SHA-256 chunked hashing of workspace files.
-2. Real Unified Git Diff Parsing: Extraction of modified files, hunks, and line deltas.
+2. Real Unified & Combined Git Diff Parsing: Extraction of modified files, hunks, line deltas,
+   conflict diffs (diff --cc / diff --combined), binary files, and escaped paths.
 3. Cross-Verification & Correlation:
    - Matches git diff changes against hash snapshot deltas.
    - Detects Phantom Diffs (git modified with unchanged hash).
    - Detects Untracked Drift (disk modified without git tracking).
-   - Detects Syntax Regressions (AST parsing on modified code).
+   - Detects Syntax Regressions (AST parsing on modified code with Python 3.10+ support).
+   - Distinguishes scratch/temporary files to prevent false-positive blocking.
+   - Detects Unresolved Git Merge Conflict Markers on disk and in diffs.
    - Enforces Protected Paths (blocks unauthorized mutation of critical files).
+   - Cross-platform path normalization and CRLF vs LF line-ending variance handling.
 4. Dynamic Zero-Hardcode Configuration: Integrated with hook_utils.config_loader.
 5. Multi-Lifecycle Hook Support: PreToolUse, PostToolUse, Stop events.
 6. Comprehensive Built-In Self-Test Suite (--self-test).
@@ -90,14 +94,17 @@ except ImportError:
 try:
     from common_hook_lib import (
         emit_stdout_json,
+        get_file_identity,
         get_tool_args,
         get_tool_call,
         get_workspace_roots,
+        is_reparse_point,
         log_diagnostic,
         post_tool_response,
         pre_tool_response,
         read_stdin_payload,
         stop_response,
+        strip_unc_prefix,
     )
 except ImportError:
     # Emergency fallback definitions
@@ -120,8 +127,12 @@ except ImportError:
         if default is None:
             default = {}
         try:
-            raw = sys.stdin.read()
+            max_bytes = 10 * 1024 * 1024
+            raw = sys.stdin.read(max_bytes + 1)
             if not raw or not raw.strip():
+                return default
+            if len(raw) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw)} > {max_bytes} bytes).")
                 return default
             parsed = json.loads(raw)
             return parsed if isinstance(parsed, dict) else default
@@ -199,6 +210,7 @@ class RegressionType(enum.Enum):
     FILE_DELETION = "file_deletion"
     SIZE_EXPLOSION = "size_explosion"
     SECURITY_REGRESSION = "security_regression"
+    MERGE_CONFLICT = "merge_conflict"
 
 
 @dataclasses.dataclass
@@ -212,13 +224,25 @@ class FileSnapshot:
     is_binary: bool = False
     syntax_valid: bool | None = None
     error: str | None = None
+    normalized_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FileSnapshot:
-        return cls(**data)
+        valid_keys = {
+            "relative_path",
+            "sha256",
+            "size_bytes",
+            "mtime",
+            "is_binary",
+            "syntax_valid",
+            "error",
+            "normalized_sha256",
+        }
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)
 
 
 @dataclasses.dataclass
@@ -253,7 +277,8 @@ class SnapshotManifest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SnapshotManifest:
         files_dict = {
-            k: FileSnapshot.from_dict(v) for k, v in data.get("files", {}).items()
+            _normalize_rel_path(k): FileSnapshot.from_dict(v)
+            for k, v in data.get("files", {}).items()
         }
         return cls(
             snapshot_id=data["snapshot_id"],
@@ -271,7 +296,7 @@ class SnapshotManifest:
 
 @dataclasses.dataclass
 class DiffHunk:
-    """Represents a unified diff hunk."""
+    """Represents a unified or combined diff hunk."""
 
     old_start: int
     old_count: int
@@ -286,17 +311,19 @@ class FileDiff:
 
     file_path: str
     old_path: str | None = None
-    change_type: str = "modified"  # modified, added, deleted, renamed
+    change_type: str = "modified"  # modified, added, deleted, renamed, conflict
     added_lines_count: int = 0
     deleted_lines_count: int = 0
     hunks: list[DiffHunk] = dataclasses.field(default_factory=list)
     raw_diff: str = ""
-
+    is_binary: bool = False
 
 
 def _normalize_rel_path(path_str: str) -> str:
-    """Safely normalize path by replacing backslashes and removing leading './' or '/' without stripping filename characters."""
-    p = path_str.replace("\\", "/")
+    """Safely normalize path by replacing backslashes and removing leading './', '/', or '\\\\?\\'."""
+    p = str(path_str).replace("\\", "/")
+    if p.startswith("//?/"):
+        p = p[4:]
     while p.startswith("./"):
         p = p[2:]
     if p.startswith("/"):
@@ -304,13 +331,44 @@ def _normalize_rel_path(path_str: str) -> str:
     return p
 
 
+def safe_rel_path(path_val: pathlib.Path | str, root_val: pathlib.Path | str) -> str:
+    """Safely compute relative path between target and root handling Windows drive casing, prefixes, and UNC paths."""
+    p_str, _ = strip_unc_prefix(str(path_val).replace("\\", "/"))
+    r_str, _ = strip_unc_prefix(str(root_val).replace("\\", "/"))
+
+    try:
+        p = pathlib.Path(p_str).resolve()
+        r = pathlib.Path(r_str).resolve()
+
+        if sys.platform == "win32" and p.drive and r.drive:
+            if p.drive.lower() == r.drive.lower() and p.drive != r.drive:
+                p_parts = list(p.parts)
+                p_parts[0] = r.parts[0]
+                p = pathlib.Path(*p_parts)
+
+        rel = p.relative_to(r)
+        return _normalize_rel_path(rel.as_posix())
+    except (ValueError, OSError):
+        try:
+            rel = os.path.relpath(p_str, r_str)
+            if not rel.startswith("..") and not os.path.isabs(rel):
+                return _normalize_rel_path(rel)
+            return ""
+        except Exception:
+            return ""
+
+
 def _clean_git_path(p: str, expected_prefix: str = "") -> str:
-    """Safely strip surrounding quotes, unescape C-style escapes, and remove a/ or b/ prefix."""
+    """Safely strip surrounding quotes, unescape C-style octal/unicode escapes, and remove a/ or b/ prefix."""
     p = p.strip()
     if p.startswith('"') and p.endswith('"') and len(p) >= 2:
         inner = p[1:-1]
         try:
-            p = inner.encode("latin1").decode("unicode_escape")
+            unesc = inner.encode("latin1").decode("unicode_escape")
+            try:
+                p = unesc.encode("latin1").decode("utf-8")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                p = unesc
         except Exception:
             p = inner
 
@@ -396,6 +454,69 @@ def _parse_diff_git_line(line: str) -> tuple[str, str]:
     return "", ""
 
 
+def _parse_diff_line(line: str) -> tuple[str, str, str]:
+    """Parse diff command line supporting git, cc (combined merge conflict), and combined formats.
+
+    Returns: (old_path, new_path, diff_flavor)
+    """
+    line = line.strip()
+    if line.startswith("diff --git "):
+        old_p, new_p = _parse_diff_git_line(line)
+        return old_p, new_p, "git"
+    elif line.startswith("diff --cc "):
+        payload = line[len("diff --cc ") :].strip()
+        cleaned = _clean_git_path(payload, "")
+        return cleaned, cleaned, "conflict"
+    elif line.startswith("diff --combined "):
+        payload = line[len("diff --combined ") :].strip()
+        cleaned = _clean_git_path(payload, "")
+        return cleaned, cleaned, "conflict"
+    return "", "", ""
+
+
+def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
+    """Parse unified and combined hunk headers. Returns (old_start, old_count, new_start, new_count) or None."""
+    # Match combined hunk headers like @@@ -1,4 -2,5 +3,8 @@@
+    m_comb = re.match(r"^@@+\s+(?:-[0-9]+(?:,[0-9]+)?\s+)*\+([0-9]+)(?:,([0-9]+))?\s+@@+", line)
+    if m_comb:
+        new_start = int(m_comb.group(1))
+        new_count = int(m_comb.group(2) or 1)
+        m_old = re.search(r"-([0-9]+)(?:,([0-9]+))?", line)
+        if m_old:
+            old_start = int(m_old.group(1))
+            old_count = int(m_old.group(2) or 1)
+        else:
+            old_start, old_count = 1, 1
+        return old_start, old_count, new_start, new_count
+
+    # Match standard unified hunk headers @@ -1,5 +1,6 @@
+    m_std = re.match(r"^@@\s+-([0-9]+)(?:,([0-9]+))?\s+\+([0-9]+)(?:,([0-9]+))?\s+@@", line)
+    if m_std:
+        return int(m_std.group(1)), int(m_std.group(2) or 1), int(m_std.group(3)), int(m_std.group(4) or 1)
+
+    return None
+
+
+def check_file_for_conflict_markers(file_path: pathlib.Path | str) -> tuple[bool, str | None]:
+    """Inspect file lines for unresolved Git merge conflict markers (<<<<<<<, =======, >>>>>>>)."""
+    try:
+        p = pathlib.Path(file_path)
+        if not p.is_file():
+            return False, None
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for idx, line in enumerate(f, 1):
+                trimmed = line.strip()
+                if line.startswith("<<<<<<< ") or trimmed == "<<<<<<<":
+                    return True, f"Conflict marker '<<<<<<<' found at line {idx}"
+                elif trimmed == "=======":
+                    return True, f"Conflict marker '=======' found at line {idx}"
+                elif line.startswith(">>>>>>> ") or trimmed == ">>>>>>>":
+                    return True, f"Conflict marker '>>>>>>>' found at line {idx}"
+        return False, None
+    except Exception:
+        return False, None
+
+
 @dataclasses.dataclass
 class GitDiffReport:
     """Report generated by parsing git diff."""
@@ -405,6 +526,8 @@ class GitDiffReport:
     total_deleted_lines: int = 0
     is_clean: bool = True
     raw_stdout: str = ""
+    git_error: str | None = None
+    untracked_files: list[str] = dataclasses.field(default_factory=list)
 
     def get_file_diff(self, path: str) -> FileDiff | None:
         normalized = _normalize_rel_path(path)
@@ -554,14 +677,38 @@ class RegressionDetector:
         # Snapshot storage directory (relative to workspace or configured)
         snapshot_dir_setting = self.config.get("snapshot_store_dir", ".regression_snapshots")
         self.snapshot_dir = self.workspace_root / snapshot_dir_setting
-        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError) as e:
+            log_diagnostic(f"Could not create snapshot directory {self.snapshot_dir}: {e}")
 
-    def compute_file_hash(self, file_path: pathlib.Path) -> tuple[str, int, float, bool]:
+    def is_scratch_or_temp(self, rel_path_str: str) -> bool:
+        """Identify if a relative path points to a scratch, temporary, draft, or cache file."""
+        normalized = _normalize_rel_path(rel_path_str).lower()
+        parts = normalized.split("/")
+        for part in parts:
+            if part in ("scratch", ".scratch", "tmp", "temp", ".tmp", ".temp", "scratchpad"):
+                return True
+        fname = parts[-1]
+        temp_prefixes = ("temp_", "tmp_", "scratch_", "~", ".#")
+        temp_suffixes = (".tmp", ".temp", ".bak", ".swp", ".swo", "~", ".part", ".crdownload")
+        if any(fname.startswith(pre) for pre in temp_prefixes):
+            return True
+        if any(fname.endswith(suf) for suf in temp_suffixes):
+            return True
+        return False
+
+    def compute_file_hash(
+        self,
+        file_path: pathlib.Path | str,
+        chunk_size: int = 65536,
+    ) -> tuple[str, int, float, bool]:
         """Compute cryptographic hash of a file using chunked streaming (§8, §18).
 
         Returns: (sha256_hash, file_size_bytes, mtime, is_binary)
         """
-        stat = file_path.stat()
+        p = pathlib.Path(file_path)
+        stat = p.stat()
         size_bytes = stat.st_size
         mtime = stat.st_mtime
 
@@ -569,32 +716,84 @@ class RegressionDetector:
         hasher = hashlib.new(algo_name)
         is_binary = False
 
-        chunk_size = 65536  # 64 KB chunks
-        with open(file_path, "rb") as f:
-            first_chunk = f.read(chunk_size)
-            if first_chunk:
-                # Check for null bytes to identify binary file
-                if b"\x00" in first_chunk:
+        with open(p, "rb") as f:
+            while chunk := f.read(chunk_size):
+                if not is_binary and b"\x00" in chunk:
                     is_binary = True
-                hasher.update(first_chunk)
-                while chunk := f.read(chunk_size):
-                    hasher.update(chunk)
+                hasher.update(chunk)
 
         return hasher.hexdigest(), size_bytes, mtime, is_binary
 
-    def check_python_syntax(self, file_path: pathlib.Path) -> tuple[bool, str | None]:
-        """Verify Python file syntax using AST compilation (§3)."""
-        if file_path.suffix.lower() != ".py":
-            return True, None
+    def compute_normalized_text_hash(
+        self,
+        file_path: pathlib.Path | str,
+        is_binary: bool = False,
+    ) -> str | None:
+        """Compute SHA-256 hash of text file with CRLF/LF line-endings normalized to LF.
+
+        Enables detecting pure line-ending regressions vs actual code modifications.
+        """
+        if is_binary:
+            return None
+        p = pathlib.Path(file_path)
         try:
-            with open(file_path, encoding="utf-8", errors="replace") as f:
+            hasher = hashlib.sha256()
+            with open(p, "rb") as f:
                 content = f.read()
-            ast.parse(content, filename=str(file_path))
+            normalized = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            hasher.update(normalized)
+            return hasher.hexdigest()
+        except Exception:
+            return None
+
+    def check_python_syntax(
+        self,
+        file_path: pathlib.Path | str,
+        content: str | None = None,
+    ) -> tuple[bool | None, str | None]:
+        """Verify Python file syntax using AST compilation (§3).
+
+        Supports Python 3.10+ syntax (pattern matching, parenthesized context managers,
+        type unions, exception groups). Gracefully catches all syntax, AST, encoding,
+        and I/O exceptions without crashing the hook.
+
+        Returns:
+            (True, None) - valid syntax
+            (False, error_msg) - syntax or AST parse error
+            (None, info_msg) - file locked/inaccessible or non-Python file
+        """
+        p = pathlib.Path(file_path)
+        if p.suffix.lower() != ".py":
+            return True, None
+
+        if content is None:
+            try:
+                with open(p, mode="r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except PermissionError as e:
+                return None, f"File locked or being written by another process (PermissionError): {e}"
+            except (FileNotFoundError, OSError) as e:
+                return None, f"File inaccessible ({type(e).__name__}): {e}"
+
+        if not content.strip():
+            # Empty or whitespace-only file is valid Python
+            return True, None
+
+        if "\x00" in content:
+            return False, "Invalid source: contains null bytes (binary or corrupted file)"
+
+        try:
+            ast.parse(content, filename=str(p))
             return True, None
         except SyntaxError as e:
-            return False, f"SyntaxError at line {e.lineno}: {e.msg}"
+            lineno = e.lineno if e.lineno is not None else 1
+            col = f", col {e.offset}" if getattr(e, "offset", None) is not None else ""
+            msg = getattr(e, "msg", str(e))
+            return False, f"SyntaxError at line {lineno}{col}: {msg}"
+        except (ValueError, RecursionError, MemoryError) as e:
+            return False, f"AST parse error ({type(e).__name__}): {e}"
         except Exception as e:
-            return False, f"AST parse error: {str(e)}"
+            return False, f"Unexpected AST error ({type(e).__name__}): {e}"
 
     def is_path_excluded(self, rel_path_str: str) -> bool:
         """Check if relative path matches any exclusion glob patterns."""
@@ -603,7 +802,6 @@ class RegressionDetector:
 
         parts = normalized.split("/")
         for pattern in excluded_patterns:
-            # Check pattern against whole path or individual directory components
             if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(f"/{normalized}", pattern):
                 return True
             for part in parts:
@@ -652,6 +850,33 @@ class RegressionDetector:
         except Exception:
             return None, None
 
+    def get_untracked_files(self) -> list[str]:
+        """Safely retrieve list of untracked files from git without shell=True (§3)."""
+        try:
+            res = subprocess.run(
+                ["git", "status", "--porcelain", "-uall"],
+                cwd=str(self.workspace_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            if res.returncode != 0 or not res.stdout:
+                return []
+            untracked: list[str] = []
+            for line in res.stdout.splitlines():
+                if line.startswith("?? "):
+                    raw_p = line[3:].strip()
+                    cleaned = _clean_git_path(raw_p, "")
+                    if cleaned and not self.is_path_excluded(cleaned):
+                        untracked.append(cleaned)
+            return untracked
+        except Exception as e:
+            log_diagnostic(f"Error querying untracked git files: {e}")
+            return []
+
     def create_snapshot(self, label: str = "", save: bool = True) -> SnapshotManifest:
         """Scan workspace and generate full cryptographic snapshot manifest."""
         snapshot_id = f"snap_{int(time.time())}_{uuid4().hex[:8]}"
@@ -663,27 +888,45 @@ class RegressionDetector:
 
         files_map: dict[str, FileSnapshot] = {}
         total_bytes = 0
+        visited_entities: set[tuple[int, int]] = set()
 
         # Walk workspace directory recursively
         for root_dir, dirs, filenames in os.walk(self.workspace_root):
-            # Prune excluded directories in-place
-            dirs[:] = [
-                d for d in dirs
-                if not self.is_path_excluded(
-                    str((pathlib.Path(root_dir) / d).relative_to(self.workspace_root))
-                )
-            ]
+            # Prune directory junctions/reparse points to avoid infinite loops and leaks
+            clean_dirs = []
+            for d in dirs:
+                d_path = pathlib.Path(root_dir) / d
+                if is_reparse_point(d_path) or d_path.is_symlink():
+                    continue
+                d_rel = safe_rel_path(d_path, self.workspace_root)
+                if not d_rel or self.is_path_excluded(d_rel):
+                    continue
+                d_ident = get_file_identity(d_path)
+                if d_ident:
+                    if d_ident in visited_entities:
+                        continue
+                    visited_entities.add(d_ident)
+                clean_dirs.append(d)
+            dirs[:] = clean_dirs
 
             for fname in filenames:
                 full_path = pathlib.Path(root_dir) / fname
                 try:
-                    rel_path = full_path.relative_to(self.workspace_root)
-                    rel_str = rel_path.as_posix()
-                except ValueError:
+                    rel_str = safe_rel_path(full_path, self.workspace_root)
+                except Exception:
                     continue
 
-                if self.is_path_excluded(rel_str):
+                if not rel_str or self.is_path_excluded(rel_str):
                     continue
+
+                # Reparse point / broken symlink check on file
+                if is_reparse_point(full_path) or full_path.is_symlink():
+                    try:
+                        resolved_file = full_path.resolve()
+                        if not resolved_file.is_file():
+                            continue
+                    except Exception:
+                        continue
 
                 try:
                     stat = full_path.stat()
@@ -691,7 +934,12 @@ class RegressionDetector:
                         log_diagnostic(f"Skipping oversized file: {rel_str} ({stat.st_size} bytes)")
                         continue
 
+                    f_ident = get_file_identity(full_path)
+                    if f_ident:
+                        visited_entities.add(f_ident)
+
                     sha256_hash, size_bytes, mtime, is_binary = self.compute_file_hash(full_path)
+                    norm_hash = self.compute_normalized_text_hash(full_path, is_binary=is_binary)
                     syntax_valid = None
                     syntax_err = None
 
@@ -706,6 +954,7 @@ class RegressionDetector:
                         is_binary=is_binary,
                         syntax_valid=syntax_valid,
                         error=syntax_err,
+                        normalized_sha256=norm_hash,
                     )
                     total_bytes += size_bytes
                 except (OSError, PermissionError) as e:
@@ -813,16 +1062,29 @@ class RegressionDetector:
                 timeout=15,
                 check=False,
             )
-            raw_stdout = res.stdout if res.returncode == 0 else ""
-            return self.parse_git_diff(raw_stdout)
+            # If git exited 0, or exited 1 (diffs found with --exit-code) and stdout has diffs
+            if res.returncode == 0:
+                return self.parse_git_diff(res.stdout)
+            elif res.returncode == 1 and res.stdout and ("diff --" in res.stdout):
+                return self.parse_git_diff(res.stdout)
+            else:
+                err_msg = res.stderr.strip() if res.stderr else f"git exited with code {res.returncode}"
+                log_diagnostic(f"Git diff returned error: {err_msg}")
+                return GitDiffReport(is_clean=True, raw_stdout="", git_error=err_msg)
+        except FileNotFoundError:
+            log_diagnostic("Git executable not found on system PATH")
+            return GitDiffReport(is_clean=True, raw_stdout="", git_error="git_not_found")
+        except subprocess.TimeoutExpired:
+            log_diagnostic("Git diff command timed out after 15s")
+            return GitDiffReport(is_clean=True, raw_stdout="", git_error="git_timeout")
         except Exception as e:
             log_diagnostic(f"Error executing git diff: {e}")
-            return GitDiffReport(is_clean=True, raw_stdout="")
+            return GitDiffReport(is_clean=True, raw_stdout="", git_error=str(e))
 
     def parse_git_diff(self, raw_diff: str) -> GitDiffReport:
-        """Parse unified git diff output into structured FileDiff and DiffHunk objects."""
+        """Parse unified and combined git diff output into structured FileDiff and DiffHunk objects."""
         if not raw_diff or not raw_diff.strip():
-            return GitDiffReport(is_clean=True, raw_stdout=raw_diff)
+            return GitDiffReport(is_clean=True, raw_stdout=raw_diff or "")
 
         file_diffs: list[FileDiff] = []
         lines = raw_diff.splitlines()
@@ -832,28 +1094,27 @@ class RegressionDetector:
         total_added = 0
         total_deleted = 0
 
-        hunk_header_regex = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-
         for line in lines:
-            if line.startswith("diff --git "):
+            if line.startswith("diff --git ") or line.startswith("diff --cc ") or line.startswith("diff --combined "):
                 if current_file_diff:
                     file_diffs.append(current_file_diff)
                     current_file_diff = None
                     current_hunk = None
 
-                old_p, new_p = _parse_diff_git_line(line)
+                old_p, new_p, diff_flavor = _parse_diff_line(line)
                 if new_p:
                     current_file_diff = FileDiff(
                         file_path=new_p,
                         old_path=old_p if old_p != new_p else None,
+                        change_type="conflict" if diff_flavor == "conflict" else "modified",
                         raw_diff=line + "\n",
                     )
             elif current_file_diff is not None:
                 current_file_diff.raw_diff += line + "\n"
 
-                if line.startswith("new file mode "):
+                if line.startswith("new file mode ") or line.startswith("--- /dev/null"):
                     current_file_diff.change_type = "added"
-                elif line.startswith("deleted file mode "):
+                elif line.startswith("deleted file mode ") or line.startswith("+++ /dev/null"):
                     current_file_diff.change_type = "deleted"
                 elif line.startswith("similarity index ") or line.startswith("rename from "):
                     current_file_diff.change_type = "renamed"
@@ -861,6 +1122,8 @@ class RegressionDetector:
                     renamed_to = _clean_git_path(line[10:].strip(), "")
                     if renamed_to:
                         current_file_diff.file_path = renamed_to
+                elif "Binary files " in line and " differ" in line:
+                    current_file_diff.is_binary = True
                 elif line.startswith("--- ") and not line.startswith("--- /dev/null"):
                     old_cand = _clean_git_path(line[4:].strip(), "a/")
                     if old_cand and not current_file_diff.old_path and old_cand != current_file_diff.file_path:
@@ -869,11 +1132,8 @@ class RegressionDetector:
                     new_cand = _clean_git_path(line[4:].strip(), "b/")
                     if new_cand:
                         current_file_diff.file_path = new_cand
-                elif hunk_match := hunk_header_regex.match(line):
-                    old_start = int(hunk_match.group(1))
-                    old_count = int(hunk_match.group(2) or 1)
-                    new_start = int(hunk_match.group(3))
-                    new_count = int(hunk_match.group(4) or 1)
+                elif hunk_parsed := _parse_hunk_header(line):
+                    old_start, old_count, new_start, new_count = hunk_parsed
                     current_hunk = DiffHunk(
                         old_start=old_start,
                         old_count=old_count,
@@ -882,6 +1142,11 @@ class RegressionDetector:
                     )
                     current_file_diff.hunks.append(current_hunk)
                 elif current_hunk is not None:
+                    # Check for merge conflict markers in hunk lines
+                    clean_marker = line.lstrip("+ -")
+                    if clean_marker.startswith("<<<<<<<") or clean_marker.startswith("=======") or clean_marker.startswith(">>>>>>>"):
+                        current_file_diff.change_type = "conflict"
+
                     if line.startswith("+") and not line.startswith("+++"):
                         current_file_diff.added_lines_count += 1
                         total_added += 1
@@ -928,74 +1193,40 @@ class RegressionDetector:
 
         issues: list[RegressionIssue] = []
 
-        # 1. Protected Paths Validation
-        for path in modified + deleted:
-            norm_path = _normalize_rel_path(path)
-            if self.is_path_protected(norm_path):
-                base_snap = base_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
-                curr_snap = curr_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
-                issues.append(
-                    RegressionIssue(
-                        issue_id=f"prot_{uuid4().hex[:6]}",
-                        issue_type=RegressionType.PROTECTED_PATH_VIOLATION,
-                        severity="critical",
-                        file_path=norm_path,
-                        description=f"Protected path '{norm_path}' was modified or deleted.",
-                        baseline_hash=base_snap.sha256,
-                        current_hash=curr_snap.sha256,
-                        is_blocking=True,
-                    )
-                )
-
-        # 2. Syntax Regressions in Current Snapshot
-        for path, snap in curr_files.items():
-            norm_path = _normalize_rel_path(path)
-            if snap.syntax_valid is False and snap.error:
-                # Check if this syntax error is new compared to baseline
-                base_snap = base_files.get(norm_path)
-                if not base_snap or base_snap.syntax_valid is not False:
-                    issues.append(
-                        RegressionIssue(
-                            issue_id=f"synt_{uuid4().hex[:6]}",
-                            issue_type=RegressionType.SYNTAX_REGRESSION,
-                            severity="critical",
-                            file_path=norm_path,
-                            description=f"Syntax regression introduced: {snap.error}",
-                            baseline_hash=base_snap.sha256 if base_snap else None,
-                            current_hash=snap.sha256,
-                            is_blocking=True,
-                        )
-                    )
-
-        # 3. Deleted Files Check
-        for path in deleted:
-            norm_path = _normalize_rel_path(path)
-            # If critical file deleted
-            if self.is_path_protected(norm_path) or norm_path.endswith((".py", ".json", ".md")):
-                base_snap = base_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
-                issues.append(
-                    RegressionIssue(
-                        issue_id=f"del_{uuid4().hex[:6]}",
-                        issue_type=RegressionType.FILE_DELETION,
-                        severity="high",
-                        file_path=norm_path,
-                        description=f"File deleted from baseline: {norm_path}",
-                        baseline_hash=base_snap.sha256,
-                        current_hash=None,
-                        is_blocking=self.is_path_protected(norm_path),
-                    )
-                )
-
-        # 4. Git Diff Cross-Matching & Correlation
+        # 1. Merge Conflicts in Git Diff & On-Disk Inspection
         git_summary: dict[str, Any] = {}
+        git_paths: set[str] = set()
+        git_has_error = False
+
         if compare_git:
             git_report = self.get_git_diff()
+            git_has_error = bool(git_report.git_error)
+            git_paths = {_normalize_rel_path(f.file_path) for f in git_report.files_changed}
+            untracked = self.get_untracked_files()
+
             git_summary = {
                 "files_changed_count": len(git_report.files_changed),
                 "total_added_lines": git_report.total_added_lines,
                 "total_deleted_lines": git_report.total_deleted_lines,
                 "is_clean": git_report.is_clean,
+                "git_error": git_report.git_error,
+                "untracked_files_count": len(untracked),
             }
+
+            # Check for conflict diffs reported by git
+            for file_diff in git_report.files_changed:
+                if file_diff.change_type == "conflict":
+                    fpath = _normalize_rel_path(file_diff.file_path)
+                    issues.append(
+                        RegressionIssue(
+                            issue_id=f"conf_{uuid4().hex[:6]}",
+                            issue_type=RegressionType.MERGE_CONFLICT,
+                            severity="critical",
+                            file_path=fpath,
+                            description=f"Git merge conflict detected in diff for '{fpath}'.",
+                            is_blocking=True,
+                        )
+                    )
 
             max_diff_lines = self.config.get("max_diff_lines", DEFAULT_CONFIG["max_diff_lines"])
             total_diff_lines = git_report.total_added_lines + git_report.total_deleted_lines
@@ -1040,28 +1271,116 @@ class RegressionDetector:
                             )
                         )
 
-        # Check for Untracked Drift: Modified on disk compared to baseline, but not in git diff
-        git_paths = {_normalize_rel_path(f.file_path) for f in git_report.files_changed} if compare_git else set()
-        block_untracked = self.config.get("block_on_untracked_drift", True)
+        # Check for unresolved merge conflict markers on disk
+        for path in modified + added:
+            norm_path = _normalize_rel_path(path)
+            full_p = self.workspace_root / norm_path
+            if full_p.is_file() and not self.is_path_excluded(norm_path):
+                has_conf, conf_msg = check_file_for_conflict_markers(full_p)
+                if has_conf:
+                    if not any(i.file_path == norm_path and i.issue_type == RegressionType.MERGE_CONFLICT for i in issues):
+                        issues.append(
+                            RegressionIssue(
+                                issue_id=f"conf_{uuid4().hex[:6]}",
+                                issue_type=RegressionType.MERGE_CONFLICT,
+                                severity="critical",
+                                file_path=norm_path,
+                                description=f"Unresolved Git merge conflict: {conf_msg}",
+                                is_blocking=True,
+                            )
+                        )
 
+        # 2. Protected Paths Validation
+        for path in modified + deleted:
+            norm_path = _normalize_rel_path(path)
+            if self.is_path_protected(norm_path):
+                base_snap = base_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
+                curr_snap = curr_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
+                issues.append(
+                    RegressionIssue(
+                        issue_id=f"prot_{uuid4().hex[:6]}",
+                        issue_type=RegressionType.PROTECTED_PATH_VIOLATION,
+                        severity="critical",
+                        file_path=norm_path,
+                        description=f"Protected path '{norm_path}' was modified or deleted.",
+                        baseline_hash=base_snap.sha256,
+                        current_hash=curr_snap.sha256,
+                        is_blocking=True,
+                    )
+                )
+
+        # 3. Syntax Regressions in Current Snapshot (Distinguishing scratch/temp vs production)
+        for path, snap in curr_files.items():
+            norm_path = _normalize_rel_path(path)
+            if snap.syntax_valid is False and snap.error:
+                base_snap = base_files.get(norm_path)
+                if not base_snap or base_snap.syntax_valid is not False:
+                    is_scratch = self.is_scratch_or_temp(norm_path)
+                    issues.append(
+                        RegressionIssue(
+                            issue_id=f"synt_{uuid4().hex[:6]}",
+                            issue_type=RegressionType.SYNTAX_REGRESSION,
+                            severity="low" if is_scratch else "critical",
+                            file_path=norm_path,
+                            description=(
+                                f"Syntax error in scratch/temporary file: {snap.error}"
+                                if is_scratch
+                                else f"Syntax regression introduced: {snap.error}"
+                            ),
+                            baseline_hash=base_snap.sha256 if base_snap else None,
+                            current_hash=snap.sha256,
+                            is_blocking=not is_scratch,
+                            metadata={"is_scratch": is_scratch},
+                        )
+                    )
+
+        # 4. Deleted Files Check
+        for path in deleted:
+            norm_path = _normalize_rel_path(path)
+            if self.is_path_protected(norm_path) or norm_path.endswith((".py", ".json", ".md")):
+                base_snap = base_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
+                issues.append(
+                    RegressionIssue(
+                        issue_id=f"del_{uuid4().hex[:6]}",
+                        issue_type=RegressionType.FILE_DELETION,
+                        severity="high",
+                        file_path=norm_path,
+                        description=f"File deleted from baseline: {norm_path}",
+                        baseline_hash=base_snap.sha256,
+                        current_hash=None,
+                        is_blocking=self.is_path_protected(norm_path),
+                    )
+                )
+
+        # 5. Untracked Drift: Modified on disk compared to baseline, but not in git diff
+        block_untracked = self.config.get("block_on_untracked_drift", True)
         for path in modified:
             norm_path = _normalize_rel_path(path)
             if norm_path not in git_paths and not self.is_path_excluded(norm_path):
                 base_snap = base_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
                 curr_snap = curr_files.get(norm_path, FileSnapshot(norm_path, "", 0, 0))
+                is_crlf_only = (
+                    base_snap.normalized_sha256 is not None
+                    and curr_snap.normalized_sha256 is not None
+                    and base_snap.normalized_sha256 == curr_snap.normalized_sha256
+                )
+                desc = (
+                    f"Untracked Drift (CRLF/LF line ending variance only): '{norm_path}' differs from baseline."
+                    if is_crlf_only
+                    else f"Untracked Drift: file '{norm_path}' content differs from baseline snapshot but is not tracked in git diff."
+                )
+                is_blocking = block_untracked and not is_crlf_only
                 issues.append(
                     RegressionIssue(
                         issue_id=f"untrack_{uuid4().hex[:6]}",
                         issue_type=RegressionType.UNTRACKED_DRIFT,
-                        severity="high" if block_untracked else "medium",
+                        severity="low" if is_crlf_only else ("high" if block_untracked else "medium"),
                         file_path=norm_path,
-                        description=(
-                            f"Untracked Drift: file '{norm_path}' content differs from baseline snapshot "
-                            f"but is not tracked in git diff."
-                        ),
+                        description=desc,
                         baseline_hash=base_snap.sha256,
                         current_hash=curr_snap.sha256,
-                        is_blocking=block_untracked,
+                        is_blocking=is_blocking,
+                        metadata={"crlf_only": is_crlf_only},
                     )
                 )
 
@@ -1084,9 +1403,13 @@ class RegressionDetector:
 # =============================================================================
 def handle_hook_event(payload: dict[str, Any]) -> dict[str, Any]:
     """Process incoming Antigravity hook payload across supported lifecycle events."""
-    roots = get_workspace_roots(payload)
-    workspace_root = roots[0] if roots else pathlib.Path.cwd().resolve()
-    detector = RegressionDetector(workspace_root=workspace_root)
+    try:
+        roots = get_workspace_roots(payload)
+        workspace_root = roots[0] if roots else pathlib.Path.cwd().resolve()
+        detector = RegressionDetector(workspace_root=workspace_root)
+    except Exception as exc:
+        log_diagnostic(f"Error initializing RegressionDetector: {exc}")
+        return pre_tool_response(decision="allow")
 
     # Check if this is PreToolUse
     tool_call = get_tool_call(payload)
@@ -1095,13 +1418,15 @@ def handle_hook_event(payload: dict[str, Any]) -> dict[str, Any]:
         args = get_tool_args(tool_call)
 
         # Inspect file write/replacement operations
-        target_file = args.get("target_file") or args.get("path") or args.get("file_path") or args.get("TargetFile")
+        target_file = (
+            args.get("target_file")
+            or args.get("path")
+            or args.get("file_path")
+            or args.get("TargetFile")
+            or args.get("TargetContent")
+        )
         if target_file and isinstance(target_file, str):
-            try:
-                target_p = pathlib.Path(target_file).resolve()
-                rel_p = target_p.relative_to(workspace_root).as_posix()
-            except (ValueError, OSError):
-                rel_p = _normalize_rel_path(target_file)
+            rel_p = safe_rel_path(target_file, workspace_root)
 
             if detector.is_path_protected(rel_p):
                 reason = (
@@ -1134,7 +1459,7 @@ def handle_hook_event(payload: dict[str, Any]) -> dict[str, Any]:
 # Self-Test Verification Suite (--self-test)
 # =============================================================================
 def run_self_test() -> bool:
-    """Execute comprehensive 13-point self-test suite covering all capabilities."""
+    """Execute comprehensive 27-point self-test suite covering all hardened capabilities."""
     import shutil
     import tempfile
 
@@ -1227,7 +1552,6 @@ def run_self_test() -> bool:
 
         # Test 7: Phantom diff detection (diff reports edit, but hash is identical)
         phantom_baseline = detector.create_snapshot(label="phantom_base", save=True)
-        # Simulate diff report claiming change while file is unchanged
         phantom_diff = (
             "diff --git a/sample.py b/sample.py\n"
             "--- a/sample.py\n"
@@ -1236,7 +1560,6 @@ def run_self_test() -> bool:
             "+# comment\n"
         )
         parsed_phantom = detector.parse_git_diff(phantom_diff)
-        # Use mocked report
         issues_phantom: list[RegressionIssue] = []
         for fd in parsed_phantom.files_changed:
             c_snap = phantom_baseline.files.get(fd.file_path)
@@ -1406,11 +1729,160 @@ def run_self_test() -> bool:
         finally:
             detector.get_git_diff = orig_get_git_diff
 
+        # Test 18: Python 3.10+ AST syntax parsing (match/case, type unions, parenthesized with, exception groups)
+        py310_code = (
+            "def handle_msg(msg: str | int) -> str:\n"
+            "    match msg:\n"
+            "        case 'hello':\n"
+            "            return 'world'\n"
+            "        case int(val) if val > 0:\n"
+            "            return f'number {val}'\n"
+            "        case _:\n"
+            "            return 'unknown'\n"
+            "\n"
+            "with (open('sample.py') as f1, open('sample.py') as f2):\n"
+            "    pass\n"
+            "\n"
+            "try:\n"
+            "    pass\n"
+            "except* ValueError:\n"
+            "    pass\n"
+        )
+        py310_file = test_dir / "py310_test.py"
+        py310_file.write_text(py310_code, encoding="utf-8")
+        val_310, err_310 = detector.check_python_syntax(py310_file)
+        assert_test(
+            val_310 is True and err_310 is None,
+            "AST parser fully supports Python 3.10+ syntax (pattern matching, type unions, parenthesized with, exception groups)",
+        )
+
+        # Test 19: Safe AST parsing on null bytes and draft code without crashing
+        null_byte_file = test_dir / "corrupt.py"
+        null_byte_file.write_bytes(b"x = 1\x00\x00y = 2\n")
+        val_null, err_null = detector.check_python_syntax(null_byte_file)
+        assert_test(
+            val_null is False and "null bytes" in (err_null or "").lower(),
+            "AST parser safely rejects corrupted files containing null bytes without crashing",
+        )
+
+        # Test 20: Safe AST parsing on in-progress / draft code (unexpected EOF, missing block)
+        draft_code = "def incomplete_function(x):\n"
+        draft_file = test_dir / "draft.py"
+        draft_file.write_text(draft_code, encoding="utf-8")
+        val_draft, err_draft = detector.check_python_syntax(draft_file)
+        assert_test(
+            val_draft is False and "syntaxerror" in (err_draft or "").lower(),
+            "AST parser gracefully handles draft/in-progress code returning formatted error without hook crash",
+        )
+
+        # Test 21: Scratch / temporary file syntax error classification as non-blocking
+        scratch_dir = test_dir / "scratch"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        scratch_broken = scratch_dir / "test_wip.py"
+        scratch_broken.write_text("def broken(:\n    pass\n", encoding="utf-8")
+
+        scratch_detector = RegressionDetector(workspace_root=test_dir)
+        snap_scratch = scratch_detector.create_snapshot(label="scratch_test", save=False)
+        rep_scratch = scratch_detector.detect_regressions(baseline=snap1, compare_git=False)
+        scratch_issues = [
+            i for i in rep_scratch.issues
+            if "scratch" in i.file_path and i.issue_type == RegressionType.SYNTAX_REGRESSION
+        ]
+        assert_test(
+            len(scratch_issues) > 0 and not scratch_issues[0].is_blocking and scratch_issues[0].severity == "low",
+            "Scratch/temporary file syntax errors are identified and classified as non-blocking low severity",
+        )
+
+        # Test 22: Combined diff parsing for 3-way merge conflicts (diff --cc and @@@ hunks)
+        conflict_diff = (
+            "diff --cc app/core.py\n"
+            "index 1111111,2222222..0000000\n"
+            "--- a/app/core.py\n"
+            "+++ b/app/core.py\n"
+            "@@@ -1,4 -1,4 +1,8 @@@\n"
+            " def run():\n"
+            "+<<<<<<< HEAD\n"
+            "+    return 'feature_a'\n"
+            "+=======\n"
+            "+    return 'feature_b'\n"
+            "+>>>>>>> branch_b\n"
+        )
+        rep_cc = detector.parse_git_diff(conflict_diff)
+        assert_test(
+            len(rep_cc.files_changed) == 1
+            and rep_cc.files_changed[0].change_type == "conflict"
+            and len(rep_cc.files_changed[0].hunks) == 1,
+            "Git diff parser recognizes 3-way merge conflicts (diff --cc) and @@@ combined hunks",
+        )
+
+        # Test 23: On-disk Git merge conflict marker detection
+        conf_file = test_dir / "conflicted_script.py"
+        conf_file.write_text(
+            "def compute():\n"
+            "<<<<<<< HEAD\n"
+            "    return 1\n"
+            "=======\n"
+            "    return 2\n"
+            ">>>>>>> feature\n",
+            encoding="utf-8",
+        )
+        has_conf, conf_msg = check_file_for_conflict_markers(conf_file)
+        assert_test(
+            has_conf is True and conf_msg is not None and "line 2" in conf_msg,
+            "File inspector detects raw unresolved Git merge conflict markers on disk",
+        )
+
+        # Test 24: Git command error code and empty stdout handling
+        empty_diff_rep = detector.parse_git_diff("")
+        assert_test(
+            empty_diff_rep.is_clean is True and len(empty_diff_rep.files_changed) == 0,
+            "Git diff parser handles empty stdout gracefully returning clean report",
+        )
+
+        # Test 25: Windows path normalization with safe_rel_path
+        p_target = "C:/MyWorkspace/subdir/module.py"
+        p_root = "c:/MyWorkspace"
+        computed_rel = safe_rel_path(p_target, p_root)
+        assert_test(
+            computed_rel == "subdir/module.py",
+            "safe_rel_path harmonizes Windows drive letter case differences (C: vs c:) and backslashes",
+        )
+
+        # Test 26: Cross-platform CRLF vs LF line-ending variance handling
+        crlf_file = test_dir / "crlf_test.py"
+        crlf_file.write_bytes(b"line1\r\nline2\r\n")
+        hash_crlf, _, _, _ = detector.compute_file_hash(crlf_file)
+        norm_hash_crlf = detector.compute_normalized_text_hash(crlf_file)
+
+        lf_file = test_dir / "lf_test.py"
+        lf_file.write_bytes(b"line1\nline2\n")
+        hash_lf, _, _, _ = detector.compute_file_hash(lf_file)
+        norm_hash_lf = detector.compute_normalized_text_hash(lf_file)
+
+        assert_test(
+            hash_crlf != hash_lf and norm_hash_crlf == norm_hash_lf and norm_hash_crlf is not None,
+            "Normalized text hashing correctly equates CRLF and LF files while preserving raw SHA-256 distinction",
+        )
+
+        # Test 27: Unicode and Vietnamese filename decoding in Git diffs
+        unicode_diff = (
+            'diff --git "a/ti\\341\\272\\277ng vi\\341\\273\\207t.py" "b/ti\\341\\272\\277ng vi\\341\\273\\207t.py"\n'
+            '--- "a/ti\\341\\272\\277ng vi\\341\\273\\207t.py"\n'
+            '+++ "b/ti\\341\\272\\277ng vi\\341\\273\\207t.py"\n'
+            "@@ -1,1 +1,1 @@\n"
+            "+# xin chao\n"
+        )
+        rep_uni = detector.parse_git_diff(unicode_diff)
+        assert_test(
+            len(rep_uni.files_changed) == 1 and rep_uni.files_changed[0].file_path == "tiếng việt.py",
+            "Git diff parser decodes C-style octal escaped UTF-8 paths (Vietnamese characters)",
+        )
+
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
     log_diagnostic(f"=== SELF-TEST COMPLETE: {tests_passed}/{tests_run} PASSED ===")
-    return tests_passed == tests_run and tests_run >= 17
+    return tests_passed == tests_run and tests_run >= 27
 
 
 # =============================================================================

@@ -22,6 +22,7 @@ import io
 import json
 import os
 import pathlib
+import random
 import sys
 import threading
 import time
@@ -87,8 +88,14 @@ except ImportError:
 
     def read_stdin_payload(default: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
-            raw = sys.stdin.read()
-            return json.loads(raw) if raw and raw.strip() else (default or {})
+            max_bytes = 10 * 1024 * 1024
+            raw = sys.stdin.read(max_bytes + 1)
+            if not raw or not raw.strip():
+                return default or {}
+            if len(raw) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw)} > {max_bytes} bytes).")
+                return default or {}
+            return json.loads(raw)
         except Exception:
             return default or {}
 
@@ -114,6 +121,89 @@ except ImportError:
             return pathlib.Path(path_str).resolve()
         except Exception:
             return pathlib.Path(path_str)
+
+
+# Cross-process file lock registry and implementation (Mục 31)
+_LOCK_COUNTS: dict[str, int] = {}
+_LOCK_FDS: dict[str, int] = {}
+_LOCK_REGISTRY_MUTEX = threading.Lock()
+
+
+class CrossProcessLock:
+    """Robust cross-process file lock supporting Windows (msvcrt) and POSIX (fcntl).
+
+    Includes process/thread reentrancy protection to prevent self-deadlock.
+    """
+
+    def __init__(self, lock_file: pathlib.Path | str, timeout: float = 10.0):
+        self.lock_file = pathlib.Path(lock_file).resolve()
+        self.timeout = timeout
+        self.fd: int | None = None
+        self._key = str(self.lock_file)
+
+    def __enter__(self) -> CrossProcessLock:
+        with _LOCK_REGISTRY_MUTEX:
+            if _LOCK_COUNTS.get(self._key, 0) > 0:
+                _LOCK_COUNTS[self._key] += 1
+                self.fd = _LOCK_FDS[self._key]
+                return self
+
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT)
+        start_time = time.monotonic()
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                with _LOCK_REGISTRY_MUTEX:
+                    _LOCK_COUNTS[self._key] = 1
+                    _LOCK_FDS[self._key] = fd
+                self.fd = fd
+                return self
+            except OSError:
+                if time.monotonic() - start_time > self.timeout:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise TimeoutError(f"Timed out waiting for file lock: {self.lock_file}")
+                time.sleep(0.01 + random.uniform(0.005, 0.015))
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        with _LOCK_REGISTRY_MUTEX:
+            count = _LOCK_COUNTS.get(self._key, 0)
+            if count > 1:
+                _LOCK_COUNTS[self._key] = count - 1
+                return
+            _LOCK_COUNTS.pop(self._key, None)
+            fd = _LOCK_FDS.pop(self._key, self.fd)
+
+        if fd is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self.fd = None
 
 
 class Role(str, Enum):
@@ -400,9 +490,19 @@ class TokenBudgetCounter:
         self._on_exhausted = on_exhausted
         self._on_compaction_trigger = on_compaction_trigger
 
-        # Storage directory - only enabled when explicitly passed or in production
+        # Storage directory - canonical path fallback to prevent omission (Mục 33)
         custom_storage = storage_path or os.environ.get("TOKEN_BUDGET_STORAGE_PATH")
-        self._storage_path = Path(custom_storage) if custom_storage else None
+        if custom_storage:
+            self._storage_path = Path(custom_storage).resolve()
+        elif "PYTEST_CURRENT_TEST" in os.environ and storage_path is None:
+            # Running under pytest with default fixture - stay isolated in-memory unless storage_path passed
+            self._storage_path = None
+        else:
+            cfg_dir = dyn_cfg.get("state_storage_dir", ".token_budget")
+            p = Path(cfg_dir)
+            self._storage_path = p.resolve() if p.is_absolute() else (_ENTERPRISE_HOOKS_ROOT / p).resolve()
+
+        self._lock_file = (self._storage_path / "counter.lock") if self._storage_path else None
 
         # Load persisted state if available
         if self._storage_path:
@@ -467,58 +567,86 @@ class TokenBudgetCounter:
         if self._storage_path:
             self._storage_path.mkdir(parents=True, exist_ok=True)
             return self._storage_path / "token_budget_state.json"
-        return Path(".token_budget") / "token_budget_state.json"
+        default_dir = (_ENTERPRISE_HOOKS_ROOT / ".token_budget").resolve()
+        default_dir.mkdir(parents=True, exist_ok=True)
+        return default_dir / "token_budget_state.json"
 
-    def _load_state(self) -> None:
-        """Load persisted state from disk."""
+    def _load_state_locked(self) -> None:
+        """Load persisted state from disk assuming cross-process lock is held."""
         storage_file = self._get_storage_file()
         if not storage_file.exists():
             return
 
         try:
             with open(storage_file, encoding="utf-8") as f:
-                data = json.load(f)
+                content = f.read()
+            if not content.strip():
+                return
+            data = json.loads(content)
 
             with self._lock:
                 for role_str, total in data.get("total_used", {}).items():
                     if role_str in self._total_used:
-                        self._total_used[role_str] = total
+                        self._total_used[role_str] = max(self._total_used[role_str], int(total))
+                    else:
+                        self._total_used[role_str] = int(total)
 
                 for role_str, issued in data.get("warning_issued", {}).items():
                     if role_str in self._warning_issued:
-                        self._warning_issued[role_str] = issued
+                        self._warning_issued[role_str] = self._warning_issued[role_str] or bool(issued)
+                    else:
+                        self._warning_issued[role_str] = bool(issued)
 
                 for role_str, issued in data.get("critical_issued", {}).items():
                     if role_str in self._critical_issued:
-                        self._critical_issued[role_str] = issued
+                        self._critical_issued[role_str] = self._critical_issued[role_str] or bool(issued)
+                    else:
+                        self._critical_issued[role_str] = bool(issued)
 
                 for role_str, issued in data.get("exhausted_issued", {}).items():
                     if role_str in self._exhausted_issued:
-                        self._exhausted_issued[role_str] = issued
+                        self._exhausted_issued[role_str] = self._exhausted_issued[role_str] or bool(issued)
+                    else:
+                        self._exhausted_issued[role_str] = bool(issued)
 
                 # Restore token entries for rolling window
                 raw_history = data.get("token_history", {})
                 cutoff = datetime.now(UTC).timestamp() - self._rolling_window_seconds
                 for role_str, entries in raw_history.items():
-                    if role_str in self._token_history and isinstance(entries, list):
-                        self._token_history[role_str].clear()
+                    if isinstance(entries, list):
+                        if role_str not in self._token_history:
+                            self._token_history[role_str] = deque(maxlen=self._max_entries_per_role)
+                        existing_ids = {e.entry_id for e in self._token_history[role_str] if hasattr(e, "entry_id")}
                         for e_dict in entries:
                             try:
                                 entry = TokenEntry.from_dict(e_dict)
                                 e_time = datetime.fromisoformat(entry.timestamp.replace("Z", "+00:00")).timestamp()
-                                if e_time >= cutoff:
+                                if e_time >= cutoff and entry.entry_id not in existing_ids:
                                     self._token_history[role_str].append(entry)
+                                    existing_ids.add(entry.entry_id)
                             except Exception:
                                 pass
 
         except (json.JSONDecodeError, OSError, KeyError) as exc:
             log_diagnostic(f"Failed to load persisted state: {exc}")
 
-    def _save_state(self) -> None:
-        """Persist state to disk safely with atomic replacement."""
-        if not self._storage_path:
+    def _load_state(self) -> None:
+        """Load persisted state from disk under cross-process lock (Mục 31)."""
+        if self._storage_path is None and "PYTEST_CURRENT_TEST" in os.environ:
             return
+        lock_file = self._lock_file or (self._get_storage_file().parent / "counter.lock")
+        try:
+            storage_file = self._get_storage_file()
+            if not storage_file.exists():
+                return
+            with CrossProcessLock(lock_file):
+                self._load_state_locked()
+        except Exception as exc:
+            log_diagnostic(f"Failed to load persisted state: {exc}")
 
+    def _save_state_locked(self) -> None:
+        """Persist state to disk safely with atomic replacement assuming cross-process lock is held."""
+        temp_file: Path | None = None
         try:
             storage_file = self._get_storage_file()
             storage_file.parent.mkdir(parents=True, exist_ok=True)
@@ -536,13 +664,38 @@ class TokenBudgetCounter:
                 "saved_at": datetime.now(UTC).isoformat(),
             }
 
-            temp_file = storage_file.with_suffix(".tmp")
+            temp_file = storage_file.with_suffix(
+                f".tmp.{os.getpid()}.{time.time_ns()}.{uuid.uuid4().hex[:6]}"
+            )
             with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
 
-            temp_file.replace(storage_file)
+            for attempt in range(5):
+                try:
+                    temp_file.replace(storage_file)
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (2 ** attempt))
         except OSError as exc:
             log_diagnostic(f"Failed to persist token budget state: {exc}")
+        finally:
+            if temp_file and temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+
+    def _save_state(self) -> None:
+        """Persist state to disk safely with atomic replacement under cross-process lock (Mục 31)."""
+        if self._storage_path is None and "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        lock_file = self._lock_file or (self._get_storage_file().parent / "counter.lock")
+        with CrossProcessLock(lock_file):
+            self._save_state_locked()
 
     def _record_event(
         self,

@@ -44,6 +44,7 @@ if str(ENTERPRISE_HOOKS_ROOT) not in sys.path:
 
 from common_hook_lib import (  # noqa: E402
     emit_stdout_json,
+    extract_tool_invocation,
     get_tool_args,
     get_tool_call,
     log_diagnostic,
@@ -156,13 +157,11 @@ def evaluate_no_any(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return pre_tool_response("allow", "Payload is not a dictionary.")
 
-    tool_call = get_tool_call(payload)
-    tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
+    tool_name, args = extract_tool_invocation(payload)
 
     if tool_name not in MONITORED_TOOLS:
         return pre_tool_response("allow", f"Tool '{tool_name}' is not monitored for strict typing.")
 
-    args = get_tool_args(tool_call)
     raw_target = extract_target_path(args)
     if not raw_target:
         return pre_tool_response("allow", "No target file found in tool args.")

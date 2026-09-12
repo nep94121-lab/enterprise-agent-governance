@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -54,6 +55,7 @@ from memory_context_manager import (
     MemoryContext,
     MemoryContextManager,
     Priority,
+    validate_storage_path,
 )
 
 # ============================================================================
@@ -72,11 +74,11 @@ def get_default_storage_path() -> Path:
 
     Avoids polluting the workspace directory by defaulting to:
     ~/.gemini/config/enterprise-hooks/.memory_context/memory_contexts.json
-    or via MEMORY_STORAGE_PATH environment variable if explicitly configured.
+    or via MEMORY_STORAGE_PATH environment variable if explicitly configured (Mục 14).
     """
     env_path = os.environ.get("MEMORY_STORAGE_PATH")
     if env_path:
-        p = Path(env_path)
+        p = validate_storage_path(env_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
     DEFAULT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -355,12 +357,16 @@ class MemoryContextAdapter:
 
     def __init__(self, storage_path: str | Path | None = None):
         if storage_path:
-            path = Path(storage_path)
+            path = validate_storage_path(storage_path)
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
             path = get_default_storage_path()
         self._storage_path = path
         self._manager = MemoryContextManager(storage_path=str(path))
+
+    def flush(self) -> None:
+        """Explicitly flush all pending changes in underlying manager to disk (Mục 13)."""
+        self._manager.flush()
 
     @property
     def storage_path(self) -> Path:
@@ -620,26 +626,29 @@ class MemoryContextAdapter:
 
 
 _adapter_singleton: MemoryContextAdapter | None = None
+_adapter_singleton_lock = threading.Lock()
 
 
 def get_memory_manager(
     storage_path: str | Path | None = None,
 ) -> MemoryContextAdapter:
-    """Get or create singleton MemoryContextAdapter."""
+    """Get or create singleton MemoryContextAdapter with thread safety (Mục 15)."""
     global _adapter_singleton
-    if _adapter_singleton is None:
-        _adapter_singleton = MemoryContextAdapter(storage_path=storage_path)
-    elif storage_path is not None:
-        target_path = Path(storage_path).resolve()
-        if _adapter_singleton.storage_path.resolve() != target_path:
-            _adapter_singleton = MemoryContextAdapter(storage_path=target_path)
-    return _adapter_singleton
+    with _adapter_singleton_lock:
+        if _adapter_singleton is None:
+            _adapter_singleton = MemoryContextAdapter(storage_path=storage_path)
+        elif storage_path is not None:
+            target_path = validate_storage_path(storage_path)
+            if _adapter_singleton.storage_path.resolve() != target_path.resolve():
+                _adapter_singleton = MemoryContextAdapter(storage_path=target_path)
+        return _adapter_singleton
 
 
 def reset_memory_manager() -> None:
-    """Reset the singleton adapter for testing purposes."""
+    """Reset the singleton adapter for testing purposes with thread safety (Mục 15)."""
     global _adapter_singleton
-    _adapter_singleton = None
+    with _adapter_singleton_lock:
+        _adapter_singleton = None
 
 
 # ============================================================================
@@ -838,6 +847,8 @@ class MCPMemoryToolHandler:
             else None
         )
 
+        self.adapter.flush()
+
         return {
             "success": True,
             "context_id": ctx.id,
@@ -906,6 +917,8 @@ class MCPMemoryToolHandler:
             redact=True,
         )
 
+        self.adapter.flush()
+
         return {
             "success": True,
             "handoff_id": handoff.id,
@@ -940,6 +953,8 @@ class MCPMemoryToolHandler:
             status=status,
             additional_notes=notes,
         )
+
+        self.adapter.flush()
 
         if handoff:
             return {
@@ -1181,6 +1196,8 @@ def capture_and_store_context(
             additional_notes="PostInvocation captured completion",
         )
 
+    adapter.flush()
+
     return {}
 
 
@@ -1248,22 +1265,21 @@ def main() -> None:
             "list-tools",
             "stats",
         ],
-        default="pre-invocation",
+        required=True,
         help="Action to perform",
     )
     parser.add_argument(
         "--context-type",
-        help="Context type for store-context action",
+        help="Context type for store/query",
     )
     parser.add_argument(
         "--content",
-        help="JSON content for store-context action",
+        help="JSON string content to store",
     )
     parser.add_argument(
         "--priority",
-        type=int,
-        default=5,
-        help="Priority level (0-10)",
+        default="normal",
+        help="Priority level",
     )
     parser.add_argument(
         "--tags",
@@ -1302,6 +1318,14 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.storage_path:
+        try:
+            validated = validate_storage_path(args.storage_path)
+            args.storage_path = str(validated)
+        except ValueError as e:
+            print(json.dumps({"error": f"Invalid --storage-path: {e}"}))
+            return
+
     if args.agent_name:
         os.environ["AGENT_NAME"] = args.agent_name
     if args.agent_id:
@@ -1312,8 +1336,11 @@ def main() -> None:
     stdin_data = {}
     if not sys.stdin.isatty():
         try:
-            stdin_raw = sys.stdin.read()
-            if stdin_raw.strip():
+            max_bytes = 10 * 1024 * 1024
+            stdin_raw = sys.stdin.read(max_bytes + 1)
+            if len(stdin_raw) > max_bytes:
+                sys.stderr.write(f"STDIN payload exceeds {max_bytes} bytes\n")
+            elif stdin_raw.strip():
                 stdin_data = json.loads(stdin_raw)
         except (json.JSONDecodeError, OSError):
             pass

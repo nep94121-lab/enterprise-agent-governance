@@ -26,17 +26,25 @@ MOCK_PATTERNS = [
     r'@patch'
 ]
 
+MAX_TEST_CODE_BYTES: int = 2 * 1024 * 1024
+
+
 def audit_test_source(code_content: str, filename: str = "test.py") -> tuple[bool, list[str]]:
     """
     Audits Python test code AST to ensure authentic assertions and zero dummy testing.
     """
     issues = []
 
+    # Large payload guard: prevent memory exhaustion / DoS
+    if len(code_content.encode("utf-8", errors="replace")) > MAX_TEST_CODE_BYTES:
+        issues.append(f"Test file {filename} exceeds safe memory limit of {MAX_TEST_CODE_BYTES} bytes.")
+        return False, issues
+    
     # Enforce minimum 120 lines
     lines = code_content.splitlines()
     if len(lines) < 120:
         issues.append(f"Test file {filename} is < 120 lines ({len(lines)} lines). Requires comprehensive testing >= 120 lines.")
-
+        
     # Check regex dummy patterns
     for pattern in DUMMY_PATTERNS:
         if re.search(pattern, code_content):
@@ -49,8 +57,8 @@ def audit_test_source(code_content: str, filename: str = "test.py") -> tuple[boo
 
     try:
         tree = ast.parse(code_content, filename=filename)
-    except SyntaxError as e:
-        return False, [f"Syntax error in test code: {str(e)}"]
+    except (SyntaxError, RecursionError, MemoryError) as e:
+        return False, [f"AST Parser error in test code: {str(e)}"]
 
     test_funcs = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")]
     if not test_funcs:
@@ -86,31 +94,68 @@ def audit_test_source(code_content: str, filename: str = "test.py") -> tuple[boo
     return len(issues) == 0, issues
 
 def run_hook():
-    """Hook entry point"""
+    """Hook entry point with standard JSON output and fail-closed security."""
     try:
-        raw_input = sys.stdin.read()
-        if not raw_input.strip():
+        MAX_STDIN_BYTES = 10 * 1024 * 1024
+        raw_input = sys.stdin.read(MAX_STDIN_BYTES + 1)
+        if not raw_input or not raw_input.strip():
+            print(json.dumps({"decision": "ALLOW", "reason": "Empty stdin payload"}, ensure_ascii=False))
+            sys.exit(0)
+
+        if len(raw_input) > MAX_STDIN_BYTES:
+            deny_msg = f"❌ [DENY]: Payload exceeds maximum limit of {MAX_STDIN_BYTES} bytes."
+            print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
             sys.exit(0)
 
         payload = json.loads(raw_input)
-
-        args = payload.get('tool_args') or payload.get('toolCall', {}).get('args') or payload.get('arguments', payload.get('kwargs', {}))
-
-        target_file = args.get("TargetFile") or args.get("path") or ""
-        code_content = args.get("CodeContent", args.get("ReplacementContent", ""))
-
-        if not code_content or not target_file:
+        if not isinstance(payload, dict):
+            print(json.dumps({"decision": "ALLOW", "reason": "Non-object payload"}, ensure_ascii=False))
             sys.exit(0)
 
+        tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+        args = (
+            payload.get("tool_args")
+            or tool_call.get("args")
+            or payload.get("arguments")
+            or payload.get("kwargs")
+            or {}
+        )
+        if not isinstance(args, dict):
+            args = {}
+        
+        target_file = (
+            args.get("TargetFile")
+            or args.get("target_file")
+            or args.get("path")
+            or args.get("FilePath")
+            or payload.get("TargetFile")
+            or ""
+        )
+        code_content = (
+            args.get("CodeContent")
+            or args.get("ReplacementContent")
+            or payload.get("CodeContent")
+            or payload.get("ReplacementContent")
+            or ""
+        )
+        
+        if not code_content or not target_file:
+            print(json.dumps({"decision": "ALLOW", "reason": "No test code to audit"}, ensure_ascii=False))
+            sys.exit(0)
+            
         if "test" in target_file.lower() and target_file.endswith(".py"):
             ok, issues = audit_test_source(code_content, target_file)
             if not ok:
-                print(f"DENY: " + " | ".join(issues))
-                sys.exit(1)
-
-    except Exception:
+                deny_msg = "❌ [QA CHALLENGER DENIED]: " + " | ".join(issues)
+                print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+                sys.exit(0)
+                
+        print(json.dumps({"decision": "ALLOW", "reason": "Test code audit passed"}, ensure_ascii=False))
         sys.exit(0)
-    sys.exit(0)
+    except Exception as exc:
+        deny_msg = f"❌ [QA CHALLENGER FAIL-CLOSED]: Error during QA audit: {exc}"
+        print(json.dumps({"decision": "DENY", "reason": deny_msg, "message": deny_msg}, ensure_ascii=False))
+        sys.exit(0)
 
 def self_test():
     print("=== RUNNING SELF-TEST: qa_challenger_enforcer.py ===")
@@ -155,7 +200,7 @@ def test_mocking():
     ok, issues = audit_test_source(mock_code, "test_mock.py")
     assert not ok and any("Virtual mocking" in iss for iss in issues), f"Test 4 Failed: {issues}"
     print("Test 4 Passed: Mocking detected and intercepted.")
-
+    
     # Test 5: Authentic test -> PASS
     valid_code = "\n" * 125 + """
 def test_auth_login():

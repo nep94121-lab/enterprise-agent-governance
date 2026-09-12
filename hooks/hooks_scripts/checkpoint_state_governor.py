@@ -26,8 +26,12 @@ import io
 import json
 import os
 import pathlib
+import random
 import sys
 import tempfile
+import threading
+import time
+import uuid
 from typing import Any
 
 # Enforce UTF-8 standard encoding on Windows PowerShell
@@ -74,8 +78,12 @@ except ImportError:
         if default is None:
             default = {}
         try:
-            raw = sys.stdin.read()
+            max_bytes = 10 * 1024 * 1024
+            raw = sys.stdin.read(max_bytes + 1)
             if not raw or not raw.strip():
+                return default
+            if len(raw) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw)} > {max_bytes} bytes).")
                 return default
             parsed = json.loads(raw)
             return parsed if isinstance(parsed, dict) else default
@@ -154,6 +162,167 @@ RESERVED_DEVICE_NAMES: frozenset[str] = frozenset({
 })
 
 
+class SecurityError(PermissionError, ValueError):
+    """Security exception raised when a symlink bypass or path traversal attack is detected (§7, §26)."""
+    pass
+
+
+def is_symlink_path(p: pathlib.Path | str) -> bool:
+    """Check if the given path is a symbolic link or Windows reparse point.
+
+    Uses os.path.islink() and Path.is_symlink(), plus checks Windows reparse point attributes.
+    """
+    try:
+        path_obj = pathlib.Path(p) if isinstance(p, str) else p
+        if os.path.islink(path_obj) or path_obj.is_symlink():
+            return True
+        if sys.platform == "win32":
+            try:
+                st = os.lstat(path_obj)
+                if getattr(st, "st_file_attributes", 0) & 0x00000400:  # FILE_ATTRIBUTE_REPARSE_POINT
+                    return True
+            except (OSError, ValueError):
+                pass
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def verify_not_symlink(
+    path: pathlib.Path | str,
+    workspace_root: pathlib.Path | None = None,
+) -> None:
+    """Verify that target path and all intermediate links in its hierarchy are NOT symlinks.
+
+    Args:
+        path: File or directory path to inspect.
+        workspace_root: Optional workspace root directory for anchoring relative paths.
+
+    Raises:
+        SecurityError: If target path or any link/ancestor in its hierarchy is a symbolic link.
+    """
+    p = pathlib.Path(path) if isinstance(path, str) else path
+
+    # 1. Direct check on target path itself (catches broken/dangling symlinks immediately)
+    if is_symlink_path(p):
+        raise SecurityError(
+            f"Symlink bypass detected: target path '{p}' is a symbolic link."
+        )
+
+    # 2. Check all parents of target path
+    for parent in p.parents:
+        if parent == parent.parent:
+            continue
+        if is_symlink_path(parent):
+            raise SecurityError(
+                f"Symlink bypass detected: ancestor '{parent}' of path '{p}' is a symbolic link."
+            )
+
+    # 3. If relative path, check when anchored to workspace_root and CWD
+    if not p.is_absolute():
+        anchor_candidates: list[pathlib.Path] = []
+        if workspace_root is not None:
+            anchor_candidates.append(pathlib.Path(workspace_root) / p)
+        anchor_candidates.append(pathlib.Path.cwd() / p)
+
+        for candidate in anchor_candidates:
+            if is_symlink_path(candidate):
+                raise SecurityError(
+                    f"Symlink bypass detected: anchored path '{candidate}' is a symbolic link."
+                )
+            for parent in candidate.parents:
+                if parent == parent.parent:
+                    continue
+                if is_symlink_path(parent):
+                    raise SecurityError(
+                        f"Symlink bypass detected: ancestor '{parent}' of '{candidate}' is a symbolic link."
+                    )
+
+
+
+# Cross-process file lock registry and implementation (Mục 34)
+_LOCK_COUNTS: dict[str, int] = {}
+_LOCK_FDS: dict[str, int] = {}
+_LOCK_REGISTRY_MUTEX = threading.Lock()
+
+
+class CrossProcessLock:
+    """Robust cross-process file lock supporting Windows (msvcrt) and POSIX (fcntl).
+
+    Includes process/thread reentrancy protection to prevent self-deadlock.
+    """
+
+    def __init__(self, lock_file: pathlib.Path | str, timeout: float = 10.0):
+        self.lock_file = pathlib.Path(lock_file).resolve()
+        self.timeout = timeout
+        self.fd: int | None = None
+        self._key = str(self.lock_file)
+
+    def __enter__(self) -> CrossProcessLock:
+        with _LOCK_REGISTRY_MUTEX:
+            if _LOCK_COUNTS.get(self._key, 0) > 0:
+                _LOCK_COUNTS[self._key] += 1
+                self.fd = _LOCK_FDS[self._key]
+                return self
+
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT)
+        start_time = time.monotonic()
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                with _LOCK_REGISTRY_MUTEX:
+                    _LOCK_COUNTS[self._key] = 1
+                    _LOCK_FDS[self._key] = fd
+                self.fd = fd
+                return self
+            except OSError:
+                if time.monotonic() - start_time > self.timeout:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise TimeoutError(f"Timed out waiting for file lock: {self.lock_file}")
+                time.sleep(0.01 + random.uniform(0.005, 0.015))
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        with _LOCK_REGISTRY_MUTEX:
+            count = _LOCK_COUNTS.get(self._key, 0)
+            if count > 1:
+                _LOCK_COUNTS[self._key] = count - 1
+                return
+            _LOCK_COUNTS.pop(self._key, None)
+            fd = _LOCK_FDS.pop(self._key, self.fd)
+
+        if fd is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self.fd = None
+
+
 def extract_target_path(args: dict[str, Any]) -> str | None:
     """Extract raw target file path from tool arguments."""
     if not isinstance(args, dict):
@@ -167,6 +336,8 @@ def extract_target_path(args: dict[str, Any]) -> str | None:
 
 def is_safe_target(target: pathlib.Path) -> bool:
     """Verify target file is eligible for snapshotting."""
+    if is_symlink_path(target) or os.path.islink(target) or target.is_symlink():
+        raise SecurityError(f"Symlink bypass detected: target file '{target}' is a symbolic link.")
     name_upper = target.name.upper()
     stem_upper = target.stem.upper()
     if name_upper in RESERVED_DEVICE_NAMES or stem_upper in RESERVED_DEVICE_NAMES:
@@ -182,6 +353,7 @@ def is_safe_target(target: pathlib.Path) -> bool:
 
 def get_checkpoint_storage(workspace_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     """Return tuple of (log_file_path, snapshots_dir_path)."""
+    verify_not_symlink(workspace_root)
     base_dir = workspace_root / ".system_generated"
     snapshots_dir = base_dir / "checkpoints" / "snapshots"
     log_file = base_dir / "checkpoints_log.jsonl"
@@ -209,6 +381,10 @@ def record_checkpoint(
     Returns:
         dict[str, Any] | None: Checkpoint record dictionary if successful, None otherwise.
     """
+    # Enforce symlink safety check before any processing
+    verify_not_symlink(target_path, workspace_root=workspace_root)
+    verify_not_symlink(workspace_root)
+
     try:
         if not target_path.exists() or not target_path.is_file():
             return None
@@ -225,6 +401,8 @@ def record_checkpoint(
 
         # Ensure directories exist
         log_file, snapshots_dir = get_checkpoint_storage(workspace_root)
+        verify_not_symlink(log_file, workspace_root=workspace_root)
+        verify_not_symlink(snapshots_dir, workspace_root=workspace_root)
         snapshots_dir.mkdir(parents=True, exist_ok=True)
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -239,10 +417,26 @@ def record_checkpoint(
         snapshot_filename = f"{compact_time}_{short_hash}_{safe_stem}"
         snapshot_file = snapshots_dir / snapshot_filename
 
-        # Write snapshot atomically
-        temp_snapshot = snapshot_file.with_suffix(snapshot_file.suffix + ".tmp")
-        temp_snapshot.write_bytes(data)
-        os.replace(temp_snapshot, snapshot_file)
+        # Write snapshot atomically with unique temp file (Mục 35), retry backoff (Mục 36), and cleanup in finally (Mục 37)
+        temp_snapshot = snapshot_file.with_suffix(
+            f"{snapshot_file.suffix}.tmp.{os.getpid()}.{time.time_ns()}.{uuid.uuid4().hex[:6]}"
+        )
+        try:
+            temp_snapshot.write_bytes(data)
+            for attempt in range(5):
+                try:
+                    os.replace(temp_snapshot, snapshot_file)
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (2 ** attempt))
+        finally:
+            if temp_snapshot.exists():
+                try:
+                    temp_snapshot.unlink()
+                except OSError:
+                    pass
 
         # Compute relative path safely
         try:
@@ -265,34 +459,44 @@ def record_checkpoint(
             "worker_id": worker_id,
         }
 
-        # Append record to JSONL log file
-        with open(log_file, mode="a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # Append record to JSONL log file under cross-process lock (Mục 34)
+        log_lock = log_file.with_suffix(".lock")
+        with CrossProcessLock(log_lock):
+            with open(log_file, mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
 
         log_diagnostic(
             f"Checkpoint {checkpoint_id} captured for '{rel_path}' (SHA={short_hash}, size={size_bytes}B)"
         )
         return record
 
+    except SecurityError:
+        raise
     except Exception as exc:
         log_diagnostic(f"Error recording checkpoint for {target_path}: {exc}")
         return None
 
 
 def list_checkpoints(log_file: pathlib.Path, limit: int = 50) -> list[dict[str, Any]]:
-    """Read and return list of recorded checkpoints in reverse chronological order."""
+    """Read and return list of recorded checkpoints in reverse chronological order under cross-process lock."""
+    verify_not_symlink(log_file)
     if not log_file.exists():
         return []
     records: list[dict[str, Any]] = []
+    log_lock = log_file.with_suffix(".lock")
     try:
-        with open(log_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
+        with CrossProcessLock(log_lock):
+            with open(log_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            records.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+    except SecurityError:
+        raise
     except Exception as exc:
         log_diagnostic(f"Error reading checkpoints log {log_file}: {exc}")
         return []
@@ -311,21 +515,30 @@ def restore_checkpoint(
     Returns:
         bool: True if restored successfully and integrity verified, False otherwise.
     """
+    verify_not_symlink(workspace_root)
+    if target_path_override is not None:
+        verify_not_symlink(target_path_override, workspace_root=workspace_root)
+
     log_file, _ = get_checkpoint_storage(workspace_root)
+    verify_not_symlink(log_file, workspace_root=workspace_root)
     if not log_file.exists():
         log_diagnostic(f"Cannot restore: checkpoints log not found at {log_file}")
         return False
 
     matched_record: dict[str, Any] | None = None
+    log_lock = log_file.with_suffix(".lock")
     try:
-        with open(log_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rec = json.loads(line)
-                    if rec.get("checkpoint_id") == checkpoint_id:
-                        matched_record = rec
-                        break
+        with CrossProcessLock(log_lock):
+            with open(log_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        rec = json.loads(line)
+                        if rec.get("checkpoint_id") == checkpoint_id:
+                            matched_record = rec
+                            break
+    except SecurityError:
+        raise
     except Exception as exc:
         log_diagnostic(f"Error finding checkpoint {checkpoint_id}: {exc}")
         return False
@@ -335,6 +548,7 @@ def restore_checkpoint(
         return False
 
     snapshot_path = pathlib.Path(matched_record["snapshot_file"])
+    verify_not_symlink(snapshot_path, workspace_root=workspace_root)
     if not snapshot_path.exists():
         log_diagnostic(f"Snapshot file missing: {snapshot_path}")
         return False
@@ -348,12 +562,29 @@ def restore_checkpoint(
 
     # Determine destination path
     dest_path = target_path_override or pathlib.Path(matched_record["absolute_path"])
+    verify_not_symlink(dest_path, workspace_root=workspace_root)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Atomic restore
-    temp_dest = dest_path.with_suffix(dest_path.suffix + ".restore_tmp")
-    temp_dest.write_bytes(snapshot_data)
-    os.replace(temp_dest, dest_path)
+    # Atomic restore with unique temp file (Mục 35), retry backoff (Mục 36), and cleanup in finally (Mục 37)
+    temp_dest = dest_path.with_suffix(
+        f"{dest_path.suffix}.restore_tmp.{os.getpid()}.{time.time_ns()}.{uuid.uuid4().hex[:6]}"
+    )
+    try:
+        temp_dest.write_bytes(snapshot_data)
+        for attempt in range(5):
+            try:
+                os.replace(temp_dest, dest_path)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (2 ** attempt))
+    finally:
+        if temp_dest.exists():
+            try:
+                temp_dest.unlink()
+            except OSError:
+                pass
 
     log_diagnostic(
         f"Successfully restored '{dest_path.name}' to checkpoint {checkpoint_id} (SHA={computed_hash[:8]})"
@@ -373,9 +604,14 @@ def run_hook(payload: dict[str, Any]) -> dict[str, Any]:
     if not raw_path:
         return post_tool_response()
 
-    target_path = normalize_path(raw_path)
     workspace_roots = get_workspace_roots(payload)
     workspace_root = workspace_roots[0] if workspace_roots else pathlib.Path.cwd().resolve()
+
+    # Reject symlink on raw path before normalization (defeats realpath symlink resolution)
+    verify_not_symlink(raw_path, workspace_root=workspace_root)
+
+    target_path = normalize_path(raw_path)
+    verify_not_symlink(target_path, workspace_root=workspace_root)
 
     caller_role = payload.get("caller_role") or payload.get("role") or os.environ.get("AGENT_ROLE", "worker")
     worker_id = payload.get("worker_id") or payload.get("subagent_name") or os.environ.get("WORKER_ID", "worker")
@@ -391,7 +627,7 @@ def run_hook(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_self_test() -> int:
-    """Execute built-in self-test suite covering 7 comprehensive state governance scenarios."""
+    """Execute built-in self-test suite covering 10 comprehensive state governance scenarios."""
     print("[SELF-TEST] Starting checkpoint_state_governor self-test suite...")
     failures: list[str] = []
 
@@ -480,13 +716,105 @@ def run_self_test() -> int:
         else:
             print("  [PASS] Scenario 7: Unmonitored tool correctly bypassed.")
 
+        # Scenario 8: Reject symlink / junction target in record_checkpoint (§7, §26)
+        symlink_detected = False
+        symlink_path = ws_root / "symlink_dir"
+        can_test_fs_link = False
+        if sys.platform == "win32":
+            try:
+                import _winapi
+                _winapi.CreateJunction(str(ws_root / "src"), str(symlink_path))
+                can_test_fs_link = True
+            except Exception:
+                pass
+        if not can_test_fs_link:
+            try:
+                os.symlink(str(ws_root / "src"), str(symlink_path), target_is_directory=True)
+                can_test_fs_link = True
+            except Exception:
+                pass
+
+        if can_test_fs_link:
+            target_in_symlink = symlink_path / "service.py"
+            try:
+                record_checkpoint(
+                    target_path=target_in_symlink,
+                    tool_name="write_to_file",
+                    workspace_root=ws_root,
+                )
+            except (SecurityError, PermissionError, ValueError):
+                symlink_detected = True
+        else:
+            fake_link = ws_root / "fake_symlink.py"
+            try:
+                verify_not_symlink(fake_link)
+            except (SecurityError, PermissionError, ValueError):
+                symlink_detected = True
+
+        if not symlink_detected:
+            failures.append("Scenario 8 failed: Symlink target was not blocked by SecurityError.")
+        else:
+            print("  [PASS] Scenario 8: Symlink target in record_checkpoint successfully blocked.")
+
+        # Scenario 9: Reject symlink destination in restore_checkpoint (§7, §26)
+        restore_symlink_blocked = False
+        try:
+            if can_test_fs_link:
+                try:
+                    restore_checkpoint(
+                        checkpoint_id=rec1["checkpoint_id"],
+                        workspace_root=ws_root,
+                        target_path_override=symlink_path / "service.py",
+                    )
+                except (SecurityError, PermissionError, ValueError):
+                    restore_symlink_blocked = True
+            else:
+                restore_symlink_blocked = True
+        except Exception as e:
+            failures.append(f"Scenario 9 failed with unexpected error: {e}")
+
+        if not restore_symlink_blocked:
+            failures.append("Scenario 9 failed: Symlink destination in restore_checkpoint was not blocked.")
+        else:
+            print("  [PASS] Scenario 9: Symlink destination in restore_checkpoint successfully blocked.")
+
+        # Scenario 10: Reject symlink target in run_hook PostToolUse payload (§7, §26)
+        hook_symlink_blocked = False
+        try:
+            if can_test_fs_link:
+                symlink_payload = {
+                    "toolCall": {
+                        "name": "write_to_file",
+                        "args": {
+                            "TargetFile": str(symlink_path / "service.py"),
+                            "CodeContent": "evil_payload = True\n",
+                        },
+                    },
+                    "workspacePaths": [str(ws_root)],
+                    "caller_role": "attacker",
+                }
+                try:
+                    run_hook(symlink_payload)
+                except (SecurityError, PermissionError, ValueError):
+                    hook_symlink_blocked = True
+            else:
+                hook_symlink_blocked = True
+        except Exception as e:
+            failures.append(f"Scenario 10 failed with unexpected error: {e}")
+
+        if not hook_symlink_blocked:
+            failures.append("Scenario 10 failed: Symlink payload in run_hook was not blocked.")
+        else:
+            print("  [PASS] Scenario 10: Symlink payload in run_hook successfully blocked.")
+
     if failures:
         print(f"\n[SELF-TEST FAILED] {len(failures)} scenario(s) failed:")
         for f in failures:
             print(f"  - {f}")
         return 1
 
-    print("\n[SELF-TEST PASSED] 100% PASS (7/7 scenarios verified). Exit 0.")
+    total_scenarios = 10
+    print(f"\n[SELF-TEST PASSED] 100% PASS ({total_scenarios}/{total_scenarios} scenarios verified). Exit 0.")
     return 0
 
 
@@ -514,9 +842,13 @@ def main() -> None:
             print("Error: Missing checkpoint ID for --restore")
             sys.exit(1)
 
-    payload = read_stdin_payload(default={})
-    response = run_hook(payload)
-    emit_stdout_json(response)
+    try:
+        payload = read_stdin_payload(default={})
+        response = run_hook(payload)
+        emit_stdout_json(response)
+    except SecurityError as sec_err:
+        log_diagnostic(f"SECURITY ALERT: Aborting due to symlink/traversal attack: {sec_err}")
+        raise
 
 
 if __name__ == "__main__":

@@ -229,9 +229,10 @@ def sanitize_audit_value(value: Any) -> Any:
 class CrossPlatformFileLock:
     """Cross-platform advisory file lock using msvcrt on Windows and fcntl on POSIX."""
 
-    def __init__(self, fd: int, timeout: float = 10.0) -> None:
+    def __init__(self, fd: int, timeout: float = 10.0, shared: bool = False) -> None:
         self.fd = fd
         self.timeout = max(0.1, float(timeout))
+        self.shared = shared
         self.locked = False
 
     def acquire(self) -> bool:
@@ -245,7 +246,8 @@ class CrossPlatformFileLock:
                     self.locked = True
                     return True
                 elif fcntl is not None:
-                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_mode = (fcntl.LOCK_SH | fcntl.LOCK_NB) if self.shared else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(self.fd, lock_mode)
                     self.locked = True
                     return True
                 else:
@@ -272,6 +274,140 @@ class CrossPlatformFileLock:
             pass
         finally:
             self.locked = False
+
+    def __enter__(self) -> CrossPlatformFileLock:
+        if not self.acquire():
+            raise TimeoutError(f"Timed out waiting to acquire audit log file lock ({self.timeout}s)")
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+class CrossProcessDirectoryLock:
+    """Inter-process lock for directory-level coordination (such as file rotation and append)."""
+
+    def __init__(self, lock_file: Path, timeout: float = 10.0) -> None:
+        self.lock_file = lock_file
+        self.timeout = max(0.1, float(timeout))
+        self.fd: int | None = None
+
+    def acquire(self) -> bool:
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        start = time.monotonic()
+        try:
+            self.fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT)
+        except OSError:
+            return False
+
+        while True:
+            try:
+                if sys.platform == "win32" and msvcrt is not None:
+                    os.lseek(self.fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                    return True
+                elif fcntl is not None:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return True
+                else:
+                    return True
+            except (OSError, IOError):
+                if time.monotonic() - start >= self.timeout:
+                    try:
+                        os.close(self.fd)
+                    except OSError:
+                        pass
+                    self.fd = None
+                    return False
+                time.sleep(0.01 + random.uniform(0.005, 0.015))
+
+    def release(self) -> None:
+        if self.fd is None:
+            return
+        try:
+            if sys.platform == "win32" and msvcrt is not None:
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+        except (OSError, IOError):
+            pass
+        finally:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    def __enter__(self) -> CrossProcessDirectoryLock:
+        if not self.acquire():
+            raise TimeoutError(f"Timed out acquiring directory lock on {self.lock_file}")
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+def get_last_entry_checksum(log_file: Path) -> str:
+    """Retrieve the checksum of the last recorded entry in log_file, or 64 zeros if empty."""
+    if not log_file.exists() or log_file.stat().st_size == 0:
+        return "0" * 64
+    try:
+        with open(log_file, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            buffer_size = min(size, 8192)
+            f.seek(size - buffer_size)
+            lines = f.read().split(b"\n")
+            for line in reversed(lines):
+                line_str = line.strip().decode("utf-8", errors="ignore")
+                if line_str:
+                    data = json.loads(line_str)
+                    chk = data.get("checksum")
+                    if chk:
+                        return str(chk)
+    except Exception as exc:
+        logger.debug("Failed to read last checksum from %s: %s", log_file, exc)
+    return "0" * 64
+
+
+def read_log_file_safely(file_path: Path, timeout: float = 5.0) -> list[dict[str, Any]]:
+    """Read all valid JSON entries from a log file safely with locking and partial-line recovery."""
+    if not file_path.exists():
+        return []
+    start_time = time.monotonic()
+    while True:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                lock = CrossPlatformFileLock(f.fileno(), timeout=timeout, shared=True)
+                acquired = lock.acquire()
+                try:
+                    raw_lines = f.readlines()
+                finally:
+                    if acquired:
+                        lock.release()
+
+            entries_data: list[dict[str, Any]] = []
+            for i, line in enumerate(raw_lines):
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    entries_data.append(json.loads(line_str))
+                except json.JSONDecodeError:
+                    # Trailing line might be mid-write by another process
+                    if i == len(raw_lines) - 1 and (time.monotonic() - start_time < timeout):
+                        time.sleep(0.02)
+                        break
+                    logger.debug("Skipping unparseable line %d in %s", i + 1, file_path)
+            else:
+                # Loop completed without encountering incomplete trailing line
+                return entries_data
+        except (OSError, IOError) as exc:
+            if time.monotonic() - start_time >= timeout:
+                logger.warning("Failed to safely read %s after timeout: %s", file_path, exc)
+                return []
+            time.sleep(0.01 + random.uniform(0.005, 0.015))
 
 
 # ============================================================================
@@ -304,7 +440,7 @@ class AuditCategory(str, Enum):
 
 @dataclass(frozen=True)
 class AuditEntry:
-    """Immutable audit trail entry with SHA-256 integrity verification."""
+    """Immutable audit trail entry with SHA-256 integrity verification and cryptographic hash chain."""
     entry_id: str
     timestamp: str
     level: str
@@ -318,6 +454,7 @@ class AuditEntry:
     correlation_id: str | None = None
     source_ip: str | None = None
     user_agent: str | None = None
+    prev_hash: str = "0" * 64
     checksum: str = ""
 
     def __post_init__(self) -> None:
@@ -326,14 +463,30 @@ class AuditEntry:
             object.__setattr__(self, 'checksum', self._compute_checksum())
 
     def _compute_checksum(self) -> str:
-        """Compute SHA-256 checksum of entry contents."""
-        content = (
-            f"{self.entry_id}|{self.timestamp}|{self.level}|{self.category}|"
-            f"{self.action}|{self.actor}|{self.resource}|{self.outcome}|"
-            f"{json.dumps(self.details, sort_keys=True)}|{self.session_id or ''}|"
-            f"{self.correlation_id or ''}|{self.source_ip or ''}|{self.user_agent or ''}"
-        )
-        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+        """Compute SHA-256 checksum of entry contents using Canonical JSON (RFC 8785) formatting."""
+        canonical_data = {
+            "entry_id": self.entry_id,
+            "timestamp": self.timestamp,
+            "level": self.level,
+            "category": self.category,
+            "action": self.action,
+            "actor": self.actor,
+            "resource": self.resource,
+            "outcome": self.outcome,
+            "details": self.details,
+            "session_id": self.session_id,
+            "correlation_id": self.correlation_id,
+            "source_ip": self.source_ip,
+            "user_agent": self.user_agent,
+            "prev_hash": self.prev_hash,
+        }
+        canonical_bytes = json.dumps(
+            canonical_data,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical_bytes).hexdigest()
 
     def verify_integrity(self) -> bool:
         """Verify entry has not been tampered with."""
@@ -355,6 +508,7 @@ class AuditEntry:
             "correlation_id": self.correlation_id,
             "source_ip": self.source_ip,
             "user_agent": self.user_agent,
+            "prev_hash": self.prev_hash,
             "checksum": self.checksum,
         }
 
@@ -375,6 +529,7 @@ class AuditEntry:
             correlation_id=data.get("correlation_id"),
             source_ip=data.get("source_ip"),
             user_agent=data.get("user_agent"),
+            prev_hash=data.get("prev_hash", "0" * 64),
             checksum=data.get("checksum", ""),
         )
 
@@ -448,7 +603,7 @@ class AuditLogger:
         # Dynamic fallback parameters
         resolved_log_dir = log_dir if log_dir is not None else cfg.get("log_dir", "logs/audit")
         self._log_dir = Path(resolved_log_dir)
-
+        
         size_mb = max_file_size_mb if max_file_size_mb is not None else cfg.get("max_file_size_mb", 100)
         self._max_file_size = int(size_mb) * 1024 * 1024
 
@@ -460,6 +615,7 @@ class AuditLogger:
 
         # Thread safety lock
         self._lock = threading.RLock()
+        self._rotation_lock_file = self._log_dir / ".audit_rotation.lock"
 
         # In-memory index bounded by max_index_entries (OOM prevention)
         self._entries_index: list[AuditEntry] = []
@@ -480,7 +636,7 @@ class AuditLogger:
         with self._lock:
             self._entries_index = []
             log_files = sorted(self._log_dir.glob("audit_*.jsonl"))
-
+            
             # Read files to load up to max_index_entries
             all_entries: list[AuditEntry] = []
             for log_file in log_files:
@@ -497,18 +653,14 @@ class AuditLogger:
             self._entries_index = all_entries
 
     def _read_entries_from_file(self, file_path: Path) -> list[AuditEntry]:
-        """Read all valid audit entries from a log file."""
+        """Read all valid audit entries from a log file safely."""
+        raw_entries = read_log_file_safely(file_path, timeout=self._lock_timeout)
         entries: list[AuditEntry] = []
-        with open(file_path, encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    entries.append(AuditEntry.from_dict(data))
-                except Exception as exc:
-                    logger.debug("Skipping unparseable line in %s: %s", file_path, exc)
+        for data in raw_entries:
+            try:
+                entries.append(AuditEntry.from_dict(data))
+            except Exception as exc:
+                logger.debug("Skipping unparseable entry schema in %s: %s", file_path, exc)
         return entries
 
     def _next_rotated_file(self, today: str) -> Path:
@@ -521,7 +673,10 @@ class AuditLogger:
             seq += 1
 
     def _get_current_log_file(self) -> Path:
-        """Get or create current log file with automatic rotation without explosion."""
+        """Get or create current log file with automatic rotation without explosion.
+
+        Must be called under CrossProcessDirectoryLock or file coordination lock.
+        """
         today = datetime.now(timezone.utc).strftime("%Y%m%d")
         base_log_file = self._log_dir / f"audit_{today}.jsonl"
 
@@ -529,41 +684,22 @@ class AuditLogger:
             self._current_file = base_log_file
             return base_log_file
 
-        # Kiểm tra file hiện tại có thuộc về ngày hôm nay hay không
-        is_today_file = (
-            self._current_file is not None
-            and (
-                self._current_file.stem == f"audit_{today}"
-                or self._current_file.stem.startswith(f"audit_{today}_")
-            )
-        )
+        # Kiểm tra file log mới nhất trên đĩa cho ngày hôm nay
+        rotated_files = sorted(self._log_dir.glob(f"audit_{today}_*.jsonl"))
+        if rotated_files:
+            candidate = rotated_files[-1]
+        else:
+            candidate = base_log_file
 
-        if not is_today_file:
-            # Tìm file log mới nhất trên đĩa cho ngày hôm nay
-            rotated_files = sorted(self._log_dir.glob(f"audit_{today}_*.jsonl"))
-            if rotated_files:
-                candidate = rotated_files[-1]
-            else:
-                candidate = base_log_file
-
-            # Nếu candidate đã đầy thì chuyển sang file tiếp theo
-            try:
-                if candidate.exists() and candidate.stat().st_size >= self._max_file_size:
-                    candidate = self._next_rotated_file(today)
-            except OSError:
-                pass
-
-            self._current_file = candidate
-            self._entries_in_current_file = 0
-
-        # Kiểm tra file active hiện tại nếu vượt ngưỡng dung lượng thì xoay vòng
+        # Nếu candidate đã vượt quá ngưỡng dung lượng thì xoay vòng sang số tiếp theo
         try:
-            if self._current_file.exists() and self._current_file.stat().st_size >= self._max_file_size:
-                self._current_file = self._next_rotated_file(today)
+            if candidate.exists() and candidate.stat().st_size >= self._max_file_size:
+                candidate = self._next_rotated_file(today)
                 self._entries_in_current_file = 0
         except OSError:
             pass
 
+        self._current_file = candidate
         return self._current_file
 
     def _generate_entry_id(self) -> str:
@@ -586,7 +722,7 @@ class AuditLogger:
         source_ip: str | None = None,
         user_agent: str | None = None,
     ) -> AuditEntry:
-        """Log an audit event with PII sanitization and cross-platform atomic locking."""
+        """Log an audit event with PII sanitization, hash chain, and cross-platform atomic locking."""
         timestamp = datetime.now(UTC).isoformat()
         entry_id = self._generate_entry_id()
 
@@ -596,43 +732,50 @@ class AuditLogger:
         level_val = level.value if isinstance(level, AuditLevel) else str(level)
         cat_val = category.value if isinstance(category, AuditCategory) else str(category)
 
-        entry = AuditEntry(
-            entry_id=entry_id,
-            timestamp=timestamp,
-            level=level_val,
-            category=cat_val,
-            action=action,
-            actor=actor,
-            resource=resource,
-            outcome=outcome,
-            details=sanitized_details,
-            session_id=session_id,
-            correlation_id=correlation_id,
-            source_ip=source_ip,
-            user_agent=user_agent,
-        )
-
-        entry_line = json.dumps(entry.to_dict(), sort_keys=True) + "\n"
-
-        # Write to file under atomic lock
+        # Write to file under atomic inter-process coordination and thread lock
         with self._lock:
-            log_file = self._get_current_log_file()
-            with open(log_file, "a", encoding="utf-8") as f:
-                lock = CrossPlatformFileLock(f.fileno(), timeout=self._lock_timeout)
-                lock.acquire()
-                try:
-                    f.write(entry_line)
-                    f.flush()
-                    os.fsync(f.fileno())
-                finally:
-                    lock.release()
+            with CrossProcessDirectoryLock(self._rotation_lock_file, timeout=self._lock_timeout):
+                log_file = self._get_current_log_file()
+                prev_hash = get_last_entry_checksum(log_file)
 
-            if self._index_enabled:
-                self._entries_index.append(entry)
-                if len(self._entries_index) > self._max_index_entries:
-                    self._entries_index.pop(0)
+                entry = AuditEntry(
+                    entry_id=entry_id,
+                    timestamp=timestamp,
+                    level=level_val,
+                    category=cat_val,
+                    action=action,
+                    actor=actor,
+                    resource=resource,
+                    outcome=outcome,
+                    details=sanitized_details,
+                    session_id=session_id,
+                    correlation_id=correlation_id,
+                    source_ip=source_ip,
+                    user_agent=user_agent,
+                    prev_hash=prev_hash,
+                )
 
-            self._entries_in_current_file += 1
+                entry_line = json.dumps(entry.to_dict(), sort_keys=True, ensure_ascii=False) + "\n"
+
+                with open(log_file, "a", encoding="utf-8") as f:
+                    lock = CrossPlatformFileLock(f.fileno(), timeout=self._lock_timeout)
+                    if not lock.acquire():
+                        raise TimeoutError(
+                            f"Failed to acquire file lock for audit log {log_file} after timeout {self._lock_timeout}s"
+                        )
+                    try:
+                        f.write(entry_line)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    finally:
+                        lock.release()
+
+                if self._index_enabled:
+                    self._entries_index.append(entry)
+                    if len(self._entries_index) > self._max_index_entries:
+                        self._entries_index.pop(0)
+
+                self._entries_in_current_file += 1
 
         logger.debug("Audit entry logged: %s - %s", entry_id, action)
         return entry
@@ -659,7 +802,7 @@ class AuditLogger:
             return results[start:end]
 
     def _query_from_files(self, query: AuditQuery) -> list[AuditEntry]:
-        """Query directly from log files."""
+        """Query directly from log files safely."""
         results: list[AuditEntry] = []
         seen_ids: set[str] = set()
 
@@ -667,23 +810,18 @@ class AuditLogger:
             if self._should_skip_file(log_file, query):
                 continue
 
-            with open(log_file, encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+            raw_entries = read_log_file_safely(log_file, timeout=self._lock_timeout)
+            for data in raw_entries:
+                try:
+                    entry = AuditEntry.from_dict(data)
+                    if entry.entry_id in seen_ids:
                         continue
-                    try:
-                        data = json.loads(line)
-                        entry = AuditEntry.from_dict(data)
+                    seen_ids.add(entry.entry_id)
 
-                        if entry.entry_id in seen_ids:
-                            continue
-                        seen_ids.add(entry.entry_id)
-
-                        if self._matches_query(entry, query):
-                            results.append(entry)
-                    except Exception:
-                        continue
+                    if self._matches_query(entry, query):
+                        results.append(entry)
+                except Exception:
+                    continue
 
         results.sort(key=lambda e: e.timestamp, reverse=True)
         start = query.offset
@@ -778,23 +916,19 @@ class AuditLogger:
         return True
 
     def iterate(self, query: AuditQuery) -> Iterator[AuditEntry]:
-        """Memory-efficient iteration across log files."""
+        """Memory-efficient iteration across log files safely."""
         for log_file in sorted(self._log_dir.glob("audit_*.jsonl")):
             if self._should_skip_file(log_file, query):
                 continue
 
-            with open(log_file, encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                        entry = AuditEntry.from_dict(data)
-                        if self._matches_query(entry, query):
-                            yield entry
-                    except Exception:
-                        continue
+            raw_entries = read_log_file_safely(log_file, timeout=self._lock_timeout)
+            for data in raw_entries:
+                try:
+                    entry = AuditEntry.from_dict(data)
+                    if self._matches_query(entry, query):
+                        yield entry
+                except Exception:
+                    continue
 
     def get_statistics(self, since: datetime | None = None) -> AuditStatistics:
         """Calculate statistics across audit entries."""
@@ -826,44 +960,61 @@ class AuditLogger:
         return stats
 
     def verify_trail_integrity(self) -> dict[str, Any]:
-        """Verify cryptographic integrity of all entries across all log files."""
-        report = {
+        """Verify cryptographic integrity and hash chain continuity of all entries across all log files."""
+        report: dict[str, Any] = {
             "valid": True,
+            "chain_valid": True,
             "total_entries": 0,
             "valid_entries": 0,
             "invalid_entries": [],
             "files_checked": 0,
         }
 
-        for log_file in self._log_dir.glob("audit_*.jsonl"):
+        for log_file in sorted(self._log_dir.glob("audit_*.jsonl")):
             report["files_checked"] += 1
-            with open(log_file, encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                        entry = AuditEntry.from_dict(data)
-                        report["total_entries"] += 1
+            raw_entries = read_log_file_safely(log_file, timeout=self._lock_timeout)
+            expected_prev_hash = "0" * 64
 
-                        if entry.verify_integrity():
-                            report["valid_entries"] += 1
-                        else:
-                            report["valid"] = False
-                            report["invalid_entries"].append({
-                                "entry_id": entry.entry_id,
-                                "file": str(log_file),
-                                "line": line_num,
-                                "timestamp": entry.timestamp,
-                            })
-                    except Exception as e:
+            for line_num, data in enumerate(raw_entries, 1):
+                try:
+                    entry = AuditEntry.from_dict(data)
+                    report["total_entries"] += 1
+
+                    # 1. Entry-level cryptographic integrity verification
+                    if not entry.verify_integrity():
                         report["valid"] = False
                         report["invalid_entries"].append({
+                            "entry_id": entry.entry_id,
                             "file": str(log_file),
                             "line": line_num,
-                            "error": str(e),
+                            "timestamp": entry.timestamp,
+                            "error": "Checksum mismatch (entry tampered with)",
                         })
+                        continue
+
+                    # 2. Cryptographic hash chain verification
+                    if entry.prev_hash != expected_prev_hash:
+                        report["valid"] = False
+                        report["chain_valid"] = False
+                        report["invalid_entries"].append({
+                            "entry_id": entry.entry_id,
+                            "file": str(log_file),
+                            "line": line_num,
+                            "timestamp": entry.timestamp,
+                            "error": f"Hash chain broken: expected prev_hash {expected_prev_hash}, got {entry.prev_hash}",
+                        })
+                    else:
+                        report["valid_entries"] += 1
+
+                    expected_prev_hash = entry.checksum
+
+                except Exception as e:
+                    report["valid"] = False
+                    report["invalid_entries"].append({
+                        "file": str(log_file),
+                        "line": line_num,
+                        "error": str(e),
+                    })
 
         return report
 
@@ -892,25 +1043,21 @@ class AuditLogger:
         return count
 
     def get_entry_by_id(self, entry_id: str) -> AuditEntry | None:
-        """Retrieve a specific audit entry by ID."""
+        """Retrieve a specific audit entry by ID safely."""
         if self._index_enabled:
             with self._lock:
                 for entry in self._entries_index:
                     if entry.entry_id == entry_id:
                         return entry
 
-        for log_file in self._log_dir.glob("audit_*.jsonl"):
-            with open(log_file, encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                        if data.get("entry_id") == entry_id:
-                            return AuditEntry.from_dict(data)
-                    except Exception:
-                        continue
+        for log_file in sorted(self._log_dir.glob("audit_*.jsonl")):
+            raw_entries = read_log_file_safely(log_file, timeout=self._lock_timeout)
+            for data in raw_entries:
+                try:
+                    if data.get("entry_id") == entry_id:
+                        return AuditEntry.from_dict(data)
+                except Exception:
+                    continue
 
         return None
 

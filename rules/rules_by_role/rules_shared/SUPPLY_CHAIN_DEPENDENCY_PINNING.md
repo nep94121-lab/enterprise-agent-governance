@@ -1,9 +1,9 @@
 # 🛡️ TIÊU CHUẨN AN TOÀN CHUỖI CUNG ỨNG & GHIM MÃ BĂM PHỤ THUỘC
 ## (SUPPLY CHAIN DEPENDENCY PINNING & INTEGRITY SPECIFICATION)
 
-> 🔴 **MÃ TÀI LIỆU:** `RULE-SEC-P1-SUPPLY-CHAIN-01`
-> 🏷️ **CẤP ĐỘ ƯU TIÊN:** **P1 (Quan Trọng / Doanh Nghiệp Bắt Buộc)**
-> 🌐 **THAM CHIẾU QUỐC TẾ:** SLSA Level 3/4 (Supply-chain Levels for Software Artifacts), Sigstore Cosign, in-toto Specification, PEP 665 / pip Hashes, npm Subresource Integrity (SRI), OWASP Top 10 Software Component Vulnerabilities.
+> 🔴 **MÃ TÀI LIỆU:** `RULE-SEC-P1-SUPPLY-CHAIN-01`  
+> 🏷️ **CẤP ĐỘ ƯU TIÊN:** **P1 (Quan Trọng / Doanh Nghiệp Bắt Buộc)**  
+> 🌐 **THAM CHIẾU QUỐC TẾ:** SLSA Level 3/4 (Supply-chain Levels for Software Artifacts), Sigstore Cosign, in-toto Specification, PEP 665 / pip Hashes, npm Subresource Integrity (SRI), OWASP Top 10 Software Component Vulnerabilities.  
 > 🎯 **PHẠM VI ÁP DỤNG:** Tất cả các vai trò phát triển mã nguồn có sử dụng thư viện bên ngoài: Backend Developer, Frontend Developer, DevOps & Security, Data/ML Engineer, Mobile App Developer.
 
 ---
@@ -171,32 +171,32 @@ import sys
 def verify_requirements_hashes(file_path: str) -> bool:
     with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
-
+    
     current_pkg = None
     has_hash = False
     missing_hashes = []
-
+    
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-
+        
         if "==" in line and not line.startswith("--hash"):
             if current_pkg and not has_hash:
                 missing_hashes.append(current_pkg)
             current_pkg = line.split("==")[0].strip()
             has_hash = False
-
+        
         if "--hash=" in line:
             has_hash = True
-
+            
     if current_pkg and not has_hash:
         missing_hashes.append(current_pkg)
-
+        
     if missing_hashes:
         print(f"[ERROR] Phát hiện packages thiếu mã băm SHA256: {missing_hashes}")
         return False
-
+        
     print("[SUCCESS] 100% packages đã được ghim mã băm SHA256 hợp lệ.")
     return True
 

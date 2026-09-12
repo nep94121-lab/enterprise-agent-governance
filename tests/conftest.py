@@ -8,9 +8,16 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
+import pathlib
 from collections import deque
 from dataclasses import dataclass
+
+ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
+for p in [str(ROOT_DIR / "hooks" / "hooks_scripts"), str(ROOT_DIR / "hooks"), str(ROOT_DIR)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from enum import StrEnum
 from typing import Any, TypedDict
 from uuid import uuid4

@@ -54,10 +54,20 @@ class ConfigValidator:
         return "hooks.json"
 
     def load_config(self) -> bool:
-        """Load and parse the JSON configuration file."""
+        """Load and parse the JSON configuration file with duplicate key detection."""
         try:
+            def _detect_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                d: dict[str, Any] = {}
+                for k, v in pairs:
+                    if k in d:
+                        self.errors.append(f"Duplicate key '{k}' detected in configuration: {self.config_path}")
+                    d[k] = v
+                return d
+
             with open(self.config_path, encoding="utf-8") as f:
-                self.config = json.load(f)
+                self.config = json.load(f, object_pairs_hook=_detect_duplicates)
+            if self.errors:
+                return False
             return True
         except FileNotFoundError:
             self.errors.append(f"Configuration file not found: {self.config_path}")
@@ -68,8 +78,12 @@ class ConfigValidator:
 
     def validate(self) -> bool:
         """Run all validation checks. Returns True if valid."""
+        load_errors = [e for e in self.errors if "Duplicate key" in e]
         self.errors.clear()
+        self.errors.extend(load_errors)
         self.warnings.clear()
+        if self.errors:
+            return False
 
         if not isinstance(self.config, dict):
             self.errors.append(f"Configuration root must be an object, got {type(self.config).__name__}")

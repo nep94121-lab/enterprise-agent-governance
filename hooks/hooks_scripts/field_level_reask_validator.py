@@ -92,15 +92,23 @@ def main() -> None:
         sys.exit(0 if success else 1)
 
     try:
-        raw = sys.stdin.read()
-        if not raw.strip():
+        max_bytes = 10 * 1024 * 1024
+        raw = sys.stdin.read(max_bytes + 1)
+        if not raw or not raw.strip():
             sys.exit(0)
+        if len(raw) > max_bytes:
+            sys.stderr.write(f"Payload exceeds limit of {max_bytes} bytes\n")
+            sys.exit(1)
         payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            sys.exit(0)
     except Exception:
         sys.exit(0)
 
     output_text = payload.get("output_text", "")
     required_fields = payload.get("required_fields", [])
+    if not isinstance(required_fields, list):
+        required_fields = []
     result = validate_and_fix(output_text, required_fields)
     sys.stdout.write(json.dumps(result) + "\n")
     sys.stdout.flush()

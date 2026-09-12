@@ -65,8 +65,12 @@ except ImportError:
         if default is None:
             default = {}
         try:
-            raw_data = sys.stdin.read()
+            max_bytes = 10 * 1024 * 1024
+            raw_data = sys.stdin.read(max_bytes + 1)
             if not raw_data or not raw_data.strip():
+                return default
+            if len(raw_data) > max_bytes:
+                log_diagnostic(f"STDIN payload exceeded maximum limit ({len(raw_data)} > {max_bytes} bytes).")
                 return default
             parsed = json.loads(raw_data)
             return parsed if isinstance(parsed, dict) else default

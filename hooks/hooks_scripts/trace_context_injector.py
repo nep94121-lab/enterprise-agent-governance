@@ -66,15 +66,23 @@ def main():
         sys.exit(0 if success else 1)
 
     try:
-        raw = sys.stdin.read()
+        max_bytes = 10 * 1024 * 1024
+        raw = sys.stdin.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            sys.stderr.write(f"Payload exceeds limit of {max_bytes} bytes\n")
+            sys.exit(1)
         if not raw.strip():
             sys.exit(0)
         data = json.loads(raw)
+        if not isinstance(data, dict):
+            sys.exit(0)
     except Exception:
         sys.exit(0)
 
-    tool_name = data.get("tool_name", "")
-    tool_args = data.get("tool_args", {})
+    tool_name = data.get("tool_name", "") or ""
+    tool_args = data.get("tool_args", {}) or {}
+    if not isinstance(tool_args, dict):
+        tool_args = {}
     inject_trace_context(tool_name, tool_args)
     sys.exit(0)
 

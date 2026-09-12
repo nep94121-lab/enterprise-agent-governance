@@ -34,10 +34,13 @@ from common_hook_lib import (  # noqa: E402
     emit_stdout_json,
     get_tool_args,
     get_tool_call,
+    is_hardlink,
+    is_reparse_point,
     log_diagnostic,
     normalize_path,
     post_tool_response,
     read_stdin_payload,
+    strip_unc_prefix,
 )
 
 # Optional dynamic config loader integration
@@ -142,7 +145,22 @@ def load_active_config() -> dict[str, Any]:
 
 
 def _atomic_write_text(file_path: pathlib.Path, content: str, encoding: str = "utf-8") -> None:
-    """Write content to file atomically using a temporary file in the same directory."""
+    """Write content to file atomically, safely handling hardlinks, symlinks, cross-volume replace, and locks."""
+    # 1. Handle Symlink / Reparse Point: write directly to real canonical target
+    if file_path.is_symlink() or is_reparse_point(file_path):
+        real_target = file_path.resolve()
+        _atomic_write_text(real_target, content, encoding=encoding)
+        return
+
+    # 2. Handle Hardlink (st_nlink > 1): must write in-place to preserve inode identity
+    if is_hardlink(file_path):
+        with open(file_path, "w", encoding=encoding, newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        return
+
+    # 3. Standard Atomic Write via temporary file in the same parent directory
     parent_dir = file_path.parent
     temp_fd, temp_path_str = tempfile.mkstemp(
         dir=str(parent_dir),
@@ -155,7 +173,38 @@ def _atomic_write_text(file_path: pathlib.Path, content: str, encoding: str = "u
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_path, file_path)
+
+        # Attempt atomic replace with retry loop for Windows sharing violation (WinError 32 / 5)
+        max_retries = 3
+        backoff = 0.05
+        for attempt in range(max_retries):
+            try:
+                os.replace(temp_path, file_path)
+                break
+            except PermissionError:
+                if attempt == max_retries - 1:
+                    try:
+                        import stat
+                        if file_path.exists():
+                            os.chmod(file_path, stat.S_IWRITE | stat.S_IREAD)
+                        os.replace(temp_path, file_path)
+                        break
+                    except Exception:
+                        raise
+                import time
+                time.sleep(backoff)
+                backoff *= 2
+            except OSError as ex:
+                # Handle EXDEV (WinError 17) cross-volume move fallback
+                if getattr(ex, "winerror", None) == 17 or getattr(ex, "errno", None) == 18:
+                    import shutil
+                    shutil.copyfile(temp_path, file_path)
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
+                    break
+                raise
     except Exception:
         if temp_path.exists():
             try:

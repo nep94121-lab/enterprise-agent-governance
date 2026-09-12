@@ -1074,6 +1074,17 @@ def _parse_file_content(path: pathlib.Path) -> dict[str, Any]:
         ValueError: If file is empty or content is not a dict.
         json.JSONDecodeError / yaml.YAMLError / UnicodeDecodeError: On syntax errors.
     """
+    MAX_CONFIG_FILE_SIZE: int = 5 * 1024 * 1024  # 5MB limit
+
+    try:
+        f_stat = path.stat()
+        if f_stat.st_size > MAX_CONFIG_FILE_SIZE:
+            raise ValueError(
+                f"Config file '{path.name}' exceeds maximum allowed size ({f_stat.st_size} > {MAX_CONFIG_FILE_SIZE} bytes)"
+            )
+    except OSError as exc:
+        raise FileNotFoundError(f"Cannot access config file '{path.name}': {exc}")
+
     raw_bytes = path.read_bytes()
     if not raw_bytes or not raw_bytes.strip():
         raise ValueError(f"Config file '{path.name}' is empty (0 bytes)")
@@ -1086,12 +1097,22 @@ def _parse_file_content(path: pathlib.Path) -> dict[str, Any]:
     if not text.strip():
         raise ValueError(f"Config file '{path.name}' contains only whitespace")
 
+    def _reject_duplicates_json(data_str: str) -> Any:
+        def _pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            d: dict[str, Any] = {}
+            for k, v in pairs:
+                if k in d:
+                    raise ValueError(f"Duplicate key detected in config JSON: {k!r}")
+                d[k] = v
+            return d
+        return json.loads(data_str, object_pairs_hook=_pairs_hook)
+
     suffix = path.suffix.lower()
     if suffix in (".yaml", ".yml"):
         if not HAS_YAML:
             # Fallback when PyYAML is unavailable: attempt JSON decoding
             try:
-                data = json.loads(text)
+                data = _reject_duplicates_json(text)
             except (json.JSONDecodeError, ValueError) as exc:
                 raise ValueError(
                     f"PyYAML is not installed and file '{path.name}' cannot be parsed as JSON: {exc}"
@@ -1099,11 +1120,11 @@ def _parse_file_content(path: pathlib.Path) -> dict[str, Any]:
         else:
             data = yaml.safe_load(text)
     elif suffix == ".json":
-        data = json.loads(text)
+        data = _reject_duplicates_json(text)
     else:
         # Unknown extension: try JSON first, then YAML
         try:
-            data = json.loads(text)
+            data = _reject_duplicates_json(text)
         except (json.JSONDecodeError, ValueError):
             if HAS_YAML:
                 data = yaml.safe_load(text)

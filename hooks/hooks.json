@@ -1,5 +1,43 @@
 {
-  "scope-boundary-enforcer": {
+  "mcp-memory-integration": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python ./hooks_scripts/mcp_memory_integration.py --action=pre-invocation",
+        "args": [
+          "--action=pre-invocation"
+        ],
+        "timeout": 30
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python ./hooks_scripts/mcp_memory_integration.py --action=post-invocation",
+        "args": [
+          "--action=post-invocation"
+        ],
+        "timeout": 30
+      }
+    ]
+  },
+  "turn-1-gate-enforcer": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/turn_1_gate_enforcer.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "top-level-agent-code-guard": {
     "enabled": true,
     "PreToolUse": [
       {
@@ -7,7 +45,52 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python ./hooks_scripts/scope_boundary_enforcer.py",
+            "command": "python ./hooks_scripts/top_level_agent_code_guard.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "action-loop-detector": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/action_loop_detector.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "lead-pm-hierarchy-enforcer": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/lead_pm_hierarchy_enforcer.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "ast-shell-sanitizer": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/ast_shell_sanitizer.py",
             "timeout": 30
           }
         ]
@@ -23,6 +106,120 @@
           {
             "type": "command",
             "command": "python ./hooks_scripts/dangerous_command_guard.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "file-ownership-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/file_ownership_guard.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "scope-boundary-enforcer": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/scope_boundary_enforcer.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "anti-sequential-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/anti_sequential_guard.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/anti_sequential_guard.py --post",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "burst-execution-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/burst_execution_guard.py",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/burst_execution_guard.py --post",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "secret-masker-guard": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/secret_masker_guard.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "audit-logger": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/audit_logger.py",
             "timeout": 30
           }
         ]
@@ -146,21 +343,6 @@
       }
     ]
   },
-  "audit-logger": {
-    "enabled": true,
-    "PostToolUse": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/audit_logger.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
   "token-budget-counter": {
     "enabled": true,
     "PostInvocation": [
@@ -206,60 +388,6 @@
       }
     ]
   },
-  "burst-execution-guard": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/burst_execution_guard.py",
-            "timeout": 60
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/burst_execution_guard.py --post",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
-  "anti-sequential-guard": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "invoke_subagent",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/anti_sequential_guard.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "invoke_subagent",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/anti_sequential_guard.py --post",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
   "hallucination-guard": {
     "enabled": true,
     "PreToolUse": [
@@ -281,43 +409,6 @@
           {
             "type": "command",
             "command": "python ./hooks_scripts/hallucination_guard.py --post",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
-  "token-budget-governor": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "write_to_file|replace_file_content|invoke_subagent|send_message",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/token_budget_governor.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "PostInvocation": [
-      {
-        "type": "command",
-        "command": "python ./hooks_scripts/token_budget_governor.py",
-        "timeout": 30
-      }
-    ]
-  },
-  "turn-1-gate-enforcer": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/turn_1_gate_enforcer.py",
             "timeout": 30
           }
         ]
@@ -375,21 +466,6 @@
           {
             "type": "command",
             "command": "python ./hooks_scripts/phase_gate_tracker.py --post",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
-  "file-ownership-guard": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "write_to_file|replace_file_content|multi_replace_file_content",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/file_ownership_guard.py",
             "timeout": 30
           }
         ]
@@ -471,21 +547,6 @@
       }
     ]
   },
-  "lead-pm-hierarchy-enforcer": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/lead_pm_hierarchy_enforcer.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
   "research-challenger-guard": {
     "enabled": true,
     "PreToolUse": [
@@ -546,21 +607,6 @@
       }
     ]
   },
-  "top-level-agent-code-guard": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "write_to_file|replace_file_content|multi_replace_file_content",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/top_level_agent_code_guard.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
   "challenger-anti-coercion-guard": {
     "enabled": true,
     "PreToolUse": [
@@ -570,21 +616,6 @@
           {
             "type": "command",
             "command": "python ./hooks_scripts/challenger_anti_coercion_guard.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
-  "ast-shell-sanitizer": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/ast_shell_sanitizer.py",
             "timeout": 30
           }
         ]
@@ -625,7 +656,7 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "invoke_subagent|send_message",
+        "matcher": "invoke_subagent|define_subagent|manage_subagents|manage_task|schedule|send_message",
         "hooks": [
           {
             "type": "command",
@@ -681,51 +712,6 @@
       }
     ]
   },
-  "secret-masker-guard": {
-    "enabled": true,
-    "PostToolUse": [
-      {
-        "matcher": "write_to_file|replace_file_content|run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/secret_masker_guard.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
-  "windows-job-object-governor": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/windows_job_object_governor.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
-  "action-loop-detector": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks_scripts/action_loop_detector.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  },
   "cot-reasoning-stripper": {
     "enabled": true,
     "PostToolUse": [
@@ -743,6 +729,18 @@
   },
   "checkpoint-state-governor": {
     "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/checkpoint_state_governor.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "write_to_file|replace_file_content",
@@ -810,6 +808,155 @@
           {
             "type": "command",
             "command": "python ./hooks_scripts/dockerfile_security_guard.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "automated-re-audit": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "run_command|write_to_file|replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/automated_re_audit.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "multi-metric-compliance-evaluator": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/multi_metric_compliance_evaluator.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "regression-detector": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/regression_detector.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "semantic-context-compressor": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "view_file|read_file|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/semantic_context_compressor.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "watchdog-deep-inspector": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "invoke_subagent|define_subagent|manage_subagents|manage_task|schedule|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/watchdog_deep_inspector.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "llm-diff-security-inspector": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/llm_diff_security_inspector.py",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  },
+  "tool-version-tracker": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python ./hooks_scripts/tool_version_tracker.py",
+        "timeout": 30
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "invoke_subagent|define_subagent|manage_subagents|manage_task|schedule",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/tool_version_tracker.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "token-budget-governor": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|invoke_subagent|send_message",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/token_budget_governor.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python ./hooks_scripts/token_budget_governor.py",
+        "timeout": 30
+      }
+    ]
+  },
+  "windows-job-object-governor": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks_scripts/windows_job_object_governor.py",
             "timeout": 30
           }
         ]

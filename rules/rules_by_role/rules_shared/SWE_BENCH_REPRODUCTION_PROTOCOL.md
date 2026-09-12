@@ -1,14 +1,14 @@
 # 🧪 SWE-BENCH REPRODUCTION PROTOCOL — QUY CHUẨN TÁI LẬP LỖI THỰC NGHIỆM
-**Mã Quy Chuẩn:** `SPEC-SWE-BENCH-REPRO-2026`
-**Phiên bản:** `2.0.0 (Princeton SWE-bench Verified Standard)`
-**Cấp độ ưu tiên:** `P0 (CƯỠNG CHẾ TUÂN THỦ TRÊN TOÀN BỘ DEV VÀ QA WORKERS)`
+**Mã Quy Chuẩn:** `SPEC-SWE-BENCH-REPRO-2026`  
+**Phiên bản:** `2.0.0 (Princeton SWE-bench Verified Standard)`  
+**Cấp độ ưu tiên:** `P0 (CƯỠNG CHẾ TUÂN THỦ TRÊN TOÀN BỘ DEV VÀ QA WORKERS)`  
 **Áp dụng:** Backend Developer, Frontend Developer, QA Challenger, Mobile App Developer, Tech Lead Auditor, Data/ML Engineer.
 
 ---
 
 ## I. TRIẾT LÝ CỐT LÕI: REPRODUCTION-FIRST INVARIANT
 
-> 🔴 **BẤT BIẾN TÁI LẬP TRƯỚC TIÊN (REPRODUCTION-FIRST INVARIANT):**
+> 🔴 **BẤT BIẾN TÁI LẬP TRƯỚC TIÊN (REPRODUCTION-FIRST INVARIANT):**  
 > **"KHÔNG CÓ BÀI TEST TÁI LẬP LỖI ĐỘC LẬP CHẠY THẤT BẠI (EXIT CODE != 0) $\rightarrow$ CẤM TUYỆT ĐỐI ĐỘNG TAY SỬA BẤT KỲ DÒNG MÃ NGUỒN SẢN PHẨM NÀO!"**
 
 Trong quy trình phát triển phần mềm chuẩn mực của Đại học Princeton (SWE-bench Verified) và các hệ thống phát triển tự trị hàng đầu thế giới (Aider, Claude Code), hơn 70% các trường hợp "sửa xong đẻ ra bug mới" (regression) hoặc "sửa ảo giác" bắt nguồn từ việc lập trình viên sửa mã nguồn dựa trên phỏng đoán (guesswork) mà không có bằng chứng thực nghiệm.
@@ -150,7 +150,7 @@ def test_reproduce_order_discount_precision_loss():
     """
     TÁI LẬP LỖI: Khi áp dụng mã giảm giá 15% trên đơn hàng lẻ,
     hệ thống bị lỗi làm tròn Decimal dẫn đến sai lệch 1 cent.
-
+    
     Expected: Tổng tiền sau giảm giá phải làm tròn theo chuẩn ROUND_HALF_UP.
     Bug Hiện Tại: Bị ép kiểu float thô gây mất chính xác.
     """
@@ -159,13 +159,13 @@ def test_reproduce_order_discount_precision_loss():
         OrderItem(product_id="P2", price=Decimal("10.00"), quantity=1), # 10.00
     ] # Subtotal: 69.97
     discount_rate = Decimal("0.15") # 15% discount = 10.4955 -> 10.50
-
+    
     # Thực thi hàm nghiệp vụ
     final_total = calculate_order_total(items, discount_rate=discount_rate)
-
+    
     # Kỳ vọng chính xác: 69.97 - 10.50 = 59.47
     expected_total = Decimal("59.47")
-
+    
     # Dòng assertion này BẮT BUỘC PHẢI FAIL trước khi sửa code
     assert final_total == expected_total, (
         f"Lỗi chính xác tiền tệ: Kết quả thực tế {final_total} "
@@ -186,19 +186,19 @@ describe("SWE-bench Reproduction: Auth Token Race Condition", () => {
     // TÁI LẬP LỖI: Khi nhiều API calls xảy ra cùng lúc khi access token hết hạn,
     // refresh token bị gọi 2 lần gây vô hiệu hóa token trên server.
     const authManager = new AuthManager({ autoRefresh: true });
-
+    
     // Giả lập 3 requests đồng thời khi token hết hạn
     const req1 = authManager.authenticatedFetch("/api/user/profile");
     const req2 = authManager.authenticatedFetch("/api/user/orders");
     const req3 = authManager.authenticatedFetch("/api/user/settings");
-
+    
     const results = await Promise.all([req1, req2, req3]);
-
+    
     // Kiểm tra tất cả các request đều thành công 200 OK
     results.forEach((res, index) => {
       expect(res.status, `Request ${index + 1} thất bại với status ${res.status}`).toBe(200);
     });
-
+    
     // Token refresh chỉ được kích hoạt đúng 1 lần duy nhất (Single-flight)
     expect(authManager.getRefreshCount()).toBe(1);
   });

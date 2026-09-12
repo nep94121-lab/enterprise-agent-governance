@@ -283,26 +283,120 @@ def filter_by_patterns(paths: list[Path], include: list[str], exclude: list[str]
 
 
 # ============================================================================
+# Locking & Concurrency
+# ============================================================================
+
+class CrossProcessLock:
+    """Robust cross-process file lock supporting Windows (msvcrt) and POSIX (fcntl)."""
+
+    def __init__(self, lock_file: Path | str, timeout: float = 10.0):
+        self.lock_file = Path(lock_file)
+        self.timeout = timeout
+        self.fd: int | None = None
+
+    def __enter__(self) -> CrossProcessLock:
+        ensure_dir(self.lock_file.parent)
+        self.fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT)
+        start_time = time.monotonic()
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() - start_time > self.timeout:
+                    if self.fd is not None:
+                        try:
+                            os.close(self.fd)
+                        except OSError:
+                            pass
+                    self.fd = None
+                    raise TimeoutError(f"Timed out waiting for file lock: {self.lock_file}")
+                time.sleep(0.02)
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self.fd is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    os.lseek(self.fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+
+
+# ============================================================================
 # Serialization / Config
 # ============================================================================
 
-def load_json(path: Path | str) -> dict | list:
-    """Load JSON from a file."""
+def load_json(path: Path | str, timeout: float = 10.0) -> dict | list:
+    """Load JSON from a file with retry for concurrent atomic replacements."""
     path = Path(path)
     if not path.exists():
         return {} if path.suffix == ".json" else []
 
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    last_err: Exception | None = None
+    for attempt in range(5):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, PermissionError, OSError) as e:
+            last_err = e
+            time.sleep(0.02 * (attempt + 1))
+            if not path.exists():
+                return {} if path.suffix == ".json" else []
+
+    if isinstance(last_err, json.JSONDecodeError):
+        raise last_err
+    return {} if path.suffix == ".json" else []
 
 
-def save_json(path: Path | str, data: Any, indent: int = 2) -> None:
-    """Save data as JSON to a file."""
-    path = Path(path)
+def save_json(path: Path | str, data: Any, indent: int = 2, timeout: float = 10.0) -> None:
+    """Save data as JSON to a file atomically with cross-process locking."""
+    path = Path(path).resolve()
     ensure_dir(path.parent)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent, ensure_ascii=False)
+    lock_file = path.parent / f".{path.name}.lock"
+    temp_file = path.parent / f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+
+    with CrossProcessLock(lock_file, timeout=timeout):
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=indent, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except (OSError, AttributeError):
+                    pass
+
+            for attempt in range(10):
+                try:
+                    os.replace(temp_file, path)
+                    break
+                except PermissionError:
+                    if attempt < 9:
+                        time.sleep(0.02 * (attempt + 1))
+                    else:
+                        raise
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def merge_configs(*configs: dict) -> dict:

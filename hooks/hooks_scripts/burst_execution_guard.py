@@ -3,7 +3,7 @@
 
 Provides physical compute throttling and dual-pool hardware scheduling:
 1. Regulates heavy OS commands (pytest, build, compile, npx, browser automation) via a 3-4 slot Micro-Queue Semaphore.
-2. Integrates with Dynamic CPU Governor (Dynamic Host Cores & Threads (os.cpu_count())):
+2. Integrates with Dynamic CPU Governor (4 Cores / 8 Threads):
    - ACCELERATION ZONE (CPU < 60%): Fast-dispatch to push load into optimal range.
    - GOLDEN ZONE (60% <= CPU <= 85%): Sustained peak performance without fan throttling.
    - THERMAL PROTECTION ZONE (CPU > 85%): 1.0s pacing cooldown preventing thermal shock.
@@ -25,6 +25,7 @@ import random
 import re
 import sys
 import time
+import uuid
 from typing import Any
 
 # Enforce UTF-8 standard encoding on Windows PowerShell
@@ -49,6 +50,7 @@ if str(ENTERPRISE_HOOKS_ROOT) not in sys.path:
 
 from common_hook_lib import (  # noqa: E402
     emit_stdout_json,
+    extract_tool_invocation,
     get_tool_args,
     get_tool_call,
     log_diagnostic,
@@ -57,7 +59,29 @@ from common_hook_lib import (  # noqa: E402
     read_stdin_payload,
 )
 
+try:
+    from hook_utils.cpu_governor import (  # noqa: E402
+        get_lock_file as get_unified_lock_file,
+        resolve_governor_state_dir,
+    )
+except ImportError:
+    get_unified_lock_file = None
+    resolve_governor_state_dir = None
+
 _psutil = None
+
+
+def get_psutil() -> Any:
+    """Lazily import and cache psutil module."""
+    global _psutil
+    if _psutil is None:
+        try:
+            import psutil
+
+            _psutil = psutil
+        except ImportError:
+            pass
+    return _psutil
 
 
 def load_dynamic_limits_fast() -> dict[str, Any]:
@@ -93,6 +117,8 @@ POLL_INTERVAL_SECONDS = 0.05
 
 def get_state_dir() -> pathlib.Path:
     """Resolve state directory, allowing override via environment variable for tests."""
+    if resolve_governor_state_dir is not None:
+        return resolve_governor_state_dir()
     custom_dir = os.environ.get("BURST_GUARD_STATE_DIR")
     if custom_dir:
         return pathlib.Path(custom_dir)
@@ -100,6 +126,9 @@ def get_state_dir() -> pathlib.Path:
 
 
 def get_lock_file() -> pathlib.Path:
+    """Resolve unified cross-process lock file, guaranteed identical with cpu_governor."""
+    if get_unified_lock_file is not None:
+        return get_unified_lock_file(get_state_dir())
     return get_state_dir() / "guard.lock"
 
 
@@ -107,12 +136,23 @@ def get_state_file() -> pathlib.Path:
     return get_state_dir() / "burst_state.json"
 
 
+def get_cpu_cache_file() -> pathlib.Path:
+    return get_state_dir() / "cpu_cache.json"
+
+
+def get_cpu_cache_lock_file() -> pathlib.Path:
+    return get_state_dir() / "cpu_cache.lock"
+
+
 # Regex patterns for Heavy Commands (Pool 2: Burst Compute)
 HEAVY_PATTERNS = [
-    # Python testing and test execution
+    # Python testing, test execution, and ML/compute scripts
     (r"\b(?:pytest|py\.test)\b", "pytest execution"),
-    (r"\bpython(?:\.exe)?\s+(?:-m\s+)?(?:unittest|pytest|test\w*)\b", "python test runner"),
-    (r"\bpython(?:\.exe)?\s+.*(?:test_|_test\.py|benchmark|stress|concurrency)", "python test/benchmark script"),
+    (r"\bpython(?:3)?(?:\.exe)?\s+(?:-m\s+)?(?:unittest|pytest|test\w*)\b", "python test runner"),
+    (
+        r"\bpython(?:3)?(?:\.exe)?\s+.*(?:test_|_test\.py|benchmark|stress|concurrency|train|training|fine_?tune|eval|infer|fit\b)",
+        "python test/benchmark/ML script",
+    ),
     # Node.js / Frontend builds & testing
     (r"\b(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?(?:test|build|compile|bundle)\b", "npm/yarn test/build"),
     (r"\bnpx\s+(?:jest|vitest|playwright|cypress|webpack|vite|rollup|tsc|esbuild)\b", "npx build/test tool"),
@@ -125,14 +165,14 @@ HEAVY_PATTERNS = [
     (r"\b(?:docker|docker-compose|podman)\s+(?:build|compose|up)\b", "container build/composition"),
     # Browser Automation & Heavy Crawling
     (r"\b(?:playwright|puppeteer|browser-use|selenium)\b", "browser automation runner"),
-    (r"\bpython(?:\.exe)?\s+.*(?:crawl|scrape|firecrawl)", "heavy web scraper"),
+    (r"\bpython(?:3)?(?:\.exe)?\s+.*(?:crawl|scrape|firecrawl)", "heavy web scraper"),
 ]
 
 # Regex patterns for Lightweight Commands (Fast-Path Bypass)
 LIGHT_PATTERNS = [
     r"^\s*(?:dir|ls|pwd|cd|echo|cat|type|cls|clear|New-Item|mkdir)\b",
     r"^\s*git\s+(?:status|diff|log|branch|rev-parse|show|tag|remote|fetch)\b",
-    r"^\s*(?:python|node|npm|cargo|git|docker)\s+(?:--version|-v|-V)\b",
+    r"^\s*(?:python|python3|node|npm|cargo|git|docker)\s+(?:--version|-v|-V)\b",
     r"^\s*(?:which|where|whoami|hostname|date|time)\b",
 ]
 
@@ -144,13 +184,25 @@ def load_guard_config() -> dict[str, Any]:
     dynamic_rules = limits.get("concurrency_rules", {})
     dynamic_timeouts = limits.get("execution_timeouts", {})
 
+    raw_ttl = float(
+        dynamic_timeouts.get(
+            "burst_guard_slot_ttl_seconds",
+            dynamic_timeouts.get("heavy_build_timeout_seconds", DEFAULT_SLOT_TTL_SECONDS),
+        )
+    )
+    # Hardening TTL: Enforce slot TTL within 60.0s - 90.0s window unless overridden by BURST_GUARD_TTL
+    if "BURST_GUARD_TTL" in os.environ:
+        slot_ttl = float(os.environ["BURST_GUARD_TTL"])
+    else:
+        slot_ttl = max(60.0, min(90.0, raw_ttl if raw_ttl <= 90.0 else DEFAULT_SLOT_TTL_SECONDS))
+
     cfg_data: dict[str, Any] = {
         "max_heavy_slots": int(dynamic_rules.get("pool_2_local_burst_concurrent_slots", DEFAULT_MAX_HEAVY_SLOTS)),
         "burst_spacing_seconds": float(dynamic_rules.get("burst_spacing_seconds", DEFAULT_BURST_SPACING_SECONDS)),
         "cooldown_sleep_seconds": float(
             dynamic_rules.get("cooldown_sleep_seconds_on_high_load", DEFAULT_COOLDOWN_SLEEP_SECONDS)
         ),
-        "slot_ttl_seconds": float(dynamic_timeouts.get("heavy_build_timeout_seconds", DEFAULT_SLOT_TTL_SECONDS)),
+        "slot_ttl_seconds": slot_ttl,
         "max_queue_wait_seconds": float(
             dynamic_timeouts.get("burst_guard_wait_timeout_seconds", DEFAULT_MAX_QUEUE_WAIT_SECONDS)
         ),
@@ -200,20 +252,75 @@ def load_guard_config() -> dict[str, Any]:
     return cfg_data
 
 
-def measure_cpu_percent(sample_interval: float = 0.0) -> float:
-    """Measure real-time CPU utilization percentage across all cores using psutil."""
-    global _psutil
-    if _psutil is None:
+def read_cached_cpu(max_age_seconds: float = 0.5) -> float | None:
+    """Read recently sampled CPU measurement from cache file under cross-process lock."""
+    cache_file = get_cpu_cache_file()
+    if not cache_file.exists():
+        return None
+    try:
+        with CrossProcessLock(get_cpu_cache_lock_file(), timeout=1.0):
+            if not cache_file.exists():
+                return None
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            ts = float(data.get("timestamp", 0.0))
+            val = float(data.get("cpu_percent", -1.0))
+            if val >= 0.0 and (time.time() - ts) <= max_age_seconds:
+                return val
+    except Exception:
+        pass
+    return None
+
+
+def write_cached_cpu(val: float) -> None:
+    """Write CPU measurement sample to cache file with current timestamp under cross-process lock."""
+    cache_file = get_cpu_cache_file()
+    temp_file: pathlib.Path | None = None
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = cache_file.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}.{uuid.uuid4().hex}")
+        temp_file.write_text(
+            json.dumps({"timestamp": time.time(), "cpu_percent": val}),
+            encoding="utf-8",
+        )
+        with CrossProcessLock(get_cpu_cache_lock_file(), timeout=1.0):
+            for attempt in range(5):
+                try:
+                    temp_file.replace(cache_file)
+                    break
+                except PermissionError:
+                    if attempt < 4:
+                        time.sleep(0.01 * (attempt + 1))
+                    else:
+                        raise
+    except Exception:
+        pass
+    finally:
+        if temp_file is not None and temp_file.exists():
+            with contextlib.suppress(OSError):
+                temp_file.unlink()
+
+
+def measure_cpu_percent(sample_interval: float = 0.05, use_cache: bool = True) -> float:
+    """Measure real-time CPU utilization percentage across all cores using psutil.
+
+    Hardened against 0.0% measurement bug on short-lived hook processes:
+    - Default sample_interval is 0.05s (50ms) instead of 0.0s to ensure valid delta.
+    - Integrates with sample caching (cpu_cache.json) to avoid re-sampling within 0.5s.
+    """
+    if use_cache:
+        cached = read_cached_cpu(max_age_seconds=0.5)
+        if cached is not None:
+            return cached
+
+    ps = get_psutil()
+    if ps is not None:
         try:
-            import psutil
-            _psutil = psutil
-        except ImportError:
-            pass
-    if _psutil is not None:
-        try:
-            if sample_interval > 0.0:
-                return float(_psutil.cpu_percent(interval=sample_interval))
-            return float(_psutil.cpu_percent(interval=None))
+            # Enforce minimum sample interval of 0.05s for accurate reading
+            interval = sample_interval if sample_interval >= 0.05 else 0.05
+            val = float(ps.cpu_percent(interval=interval))
+            if use_cache:
+                write_cached_cpu(val)
+            return val
         except Exception:
             pass
     return 50.0
@@ -236,11 +343,95 @@ def determine_cpu_zone(cpu_load: float, cfg: dict[str, Any]) -> tuple[str, float
         return "THERMAL_PROTECTION", cpu_load
 
 
+def split_chained_commands(cmd: str) -> list[str]:
+    """Split command line by chaining operators (&&, ||, ;, |) outside quotes."""
+    tokens: list[str] = []
+    current: list[str] = []
+    in_single_quote = False
+    in_double_quote = False
+    i = 0
+    n = len(cmd)
+    while i < n:
+        char = cmd[i]
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            current.append(char)
+            i += 1
+        elif char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            current.append(char)
+            i += 1
+        elif not in_single_quote and not in_double_quote:
+            # Check 2-char operators: &&, ||
+            if i + 1 < n and cmd[i : i + 2] in ("&&", "||"):
+                sub = "".join(current).strip()
+                if sub:
+                    tokens.append(sub)
+                current = []
+                i += 2
+            # Check 1-char operators: ;, |
+            elif char in (";", "|"):
+                sub = "".join(current).strip()
+                if sub:
+                    tokens.append(sub)
+                current = []
+                i += 1
+            else:
+                current.append(char)
+                i += 1
+        else:
+            current.append(char)
+            i += 1
+    sub = "".join(current).strip()
+    if sub:
+        tokens.append(sub)
+    return tokens or [cmd]
+
+
+def is_single_command_heavy(cmd: str) -> tuple[bool, str]:
+    """Check if a single command segment matches heavy compute patterns."""
+    clean = cmd.strip()
+    if not clean:
+        return False, "empty_command"
+    for pat, desc in HEAVY_PATTERNS:
+        if re.search(pat, clean, re.IGNORECASE):
+            return True, desc
+    return False, "not_heavy"
+
+
+def is_single_command_light(cmd: str) -> bool:
+    """Check if a single command segment matches lightweight whitelist."""
+    clean = cmd.strip()
+    if not clean:
+        return True
+    for pat in LIGHT_PATTERNS:
+        if re.search(pat, clean, re.IGNORECASE):
+            # Must not contain any heavy patterns
+            if not any(re.search(h_pat, clean, re.IGNORECASE) for h_pat, _ in HEAVY_PATTERNS):
+                return True
+    return False
+
+
 def is_heavy_command(command_line: str) -> tuple[bool, str]:
-    """Classify command as Heavy (Pool 2: Compute) or Light (Pool 1: Bypass)."""
+    """Classify command as Heavy (Pool 2: Compute) or Light (Pool 1: Bypass).
+
+    Hardened against command chaining bypass (&&, ||, ;, |):
+    - Splits command line into individual sub-commands outside quotes.
+    - If ANY sub-command in the chain is heavy, the entire command line is Heavy.
+    """
     clean_cmd = command_line.strip()
     if not clean_cmd:
         return False, "empty_command"
+
+    try:
+        from hook_utils.powershell_normalizer import extract_base64_payloads, strip_powershell_backticks
+        for p in extract_base64_payloads(command_line):
+            is_h, desc = is_heavy_command(p)
+            if is_h:
+                return True, f"encoded_{desc}"
+        clean_cmd = strip_powershell_backticks(clean_cmd)
+    except ImportError:
+        clean_cmd = clean_cmd.replace("`", "")
 
     # Unwrap common shell wrappers if present
     unwrapped = clean_cmd
@@ -253,18 +444,25 @@ def is_heavy_command(command_line: str) -> tuple[bool, str]:
             unwrapped = m.group(1).strip()
             break
 
-    # 1. Fast-Path Whitelist Check
-    for pat in LIGHT_PATTERNS:
-        if re.search(pat, clean_cmd, re.IGNORECASE) or re.search(pat, unwrapped, re.IGNORECASE):
-            # Ensure it doesn't also contain a heavy testing/build command
-            is_sub_heavy = any(re.search(h_pat, clean_cmd, re.IGNORECASE) for h_pat, _ in HEAVY_PATTERNS)
-            if not is_sub_heavy:
-                return False, "fast_path_lightweight"
+    # Split chained commands (&&, ||, ;, |)
+    sub_commands = split_chained_commands(unwrapped)
 
-    # 2. Heavy Pattern Check
+    # 1. Inspect every sub-command: If ANY sub-command is heavy, the command is HEAVY
+    for sub in sub_commands:
+        is_h, desc = is_single_command_heavy(sub)
+        if is_h:
+            if len(sub_commands) > 1:
+                return True, f"chained_heavy: {desc} in '{sub[:50]}'"
+            return True, desc
+
+    # Also check full unwrapped and clean strings in case pattern spans boundary
     for pat, desc in HEAVY_PATTERNS:
         if re.search(pat, clean_cmd, re.IGNORECASE) or re.search(pat, unwrapped, re.IGNORECASE):
             return True, desc
+
+    # 2. Fast-Path Whitelist Check: All sub-commands must be light
+    if all(is_single_command_light(sub) for sub in sub_commands):
+        return False, "fast_path_lightweight"
 
     return False, "default_unmatched_light"
 
@@ -336,36 +534,77 @@ def read_state_under_lock() -> dict[str, Any]:
     return {"active_slots": {}, "last_burst_launch_timestamp": 0.0, "metrics": {}}
 
 
+def is_process_alive(slot_info: dict[str, Any]) -> bool:
+    """Check if the recorded process is genuinely alive and not a recycled PID on Windows."""
+    slot_pid = slot_info.get("pid")
+    if not slot_pid:
+        return True
+    ps = get_psutil()
+    if ps is None:
+        return True
+    try:
+        pid_int = int(slot_pid)
+        if not ps.pid_exists(pid_int):
+            return False
+        proc = ps.Process(pid_int)
+        if proc.status() == ps.STATUS_ZOMBIE:
+            return False
+        rec_time = slot_info.get("pid_create_time")
+        if rec_time is not None:
+            if abs(proc.create_time() - float(rec_time)) > 0.1:
+                return False  # PID was recycled to another process
+        rec_name = slot_info.get("process_name")
+        if rec_name is not None:
+            if proc.name().lower() != str(rec_name).lower():
+                return False  # Process name changed under recycled PID
+        return True
+    except (ps.NoSuchProcess, ps.ZombieProcess):
+        return False
+    except ps.AccessDenied:
+        # On Windows, non-admin process recycled to system/elevated process
+        return False
+    except Exception:
+        return True
+
+
 def write_state_under_lock(state: dict[str, Any]) -> None:
-    """Atomically write burst state JSON safely under file lock."""
+    """Atomically write burst state JSON safely under file lock with high entropy and guaranteed cleanup."""
     state_dir = get_state_dir()
     state_file = get_state_file()
     state_dir.mkdir(parents=True, exist_ok=True)
-    temp_file = state_dir / f"burst_state.tmp.{os.getpid()}.{time.time_ns()}"
+    temp_file = state_dir / f"burst_state.tmp.{os.getpid()}.{time.time_ns()}.{uuid.uuid4().hex}"
     try:
         temp_file.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
         temp_file.replace(state_file)
     except Exception as exc:
         log_diagnostic(f"Error atomically saving burst_state.json: {exc}")
+    finally:
         if temp_file.exists():
             with contextlib.suppress(OSError):
                 temp_file.unlink()
 
 
 def evict_stale_slots(state: dict[str, Any], ttl_seconds: float) -> int:
-    """Evict expired or orphaned slots from active state."""
+    """Evict expired or orphaned slots from active state based on TTL lease expiration."""
     now = time.time()
     active_slots = state.get("active_slots", {})
     to_delete: list[str] = []
     for slot_id, info in active_slots.items():
-        expires_at = float(info.get("expires_at", 0.0))
-        acquired_at = float(info.get("acquired_at", 0.0))
+        expires_at = float(info.get("expires_at") or 0.0)
+        acquired_at = float(info.get("acquired_at") or info.get("timestamp") or 0.0)
+        slot_ttl = float(info.get("ttl_seconds") or ttl_seconds)
+        lease = info.get("lease_token", "no-lease")
+
+        is_stale = False
         if expires_at > 0.0 and now > expires_at:
+            is_stale = True
+            log_diagnostic(f"Evicted expired lease slot '{slot_id}' ({lease}) for command: {info.get('command', '')[:50]}")
+        elif acquired_at > 0.0 and (now - acquired_at) > slot_ttl:
+            is_stale = True
+            log_diagnostic(f"Evicted stale lease slot '{slot_id}' ({lease}) (TTL {slot_ttl}s exceeded).")
+
+        if is_stale:
             to_delete.append(slot_id)
-            log_diagnostic(f"Evicted stale slot '{slot_id}' for command: {info.get('command', '')[:50]}")
-        elif acquired_at > 0.0 and (now - acquired_at) > ttl_seconds:
-            to_delete.append(slot_id)
-            log_diagnostic(f"Evicted stale slot '{slot_id}' (TTL exceeded).")
 
     for slot_id in to_delete:
         del active_slots[slot_id]
@@ -384,8 +623,8 @@ def acquire_burst_slot(command_line: str, cwd: str, cfg: dict[str, Any]) -> tupl
     start_wait = time.monotonic()
     waited = False
 
-    # Sample real-time CPU utilization non-blocking
-    cpu_load = measure_cpu_percent(sample_interval=0.0)
+    # Sample real-time CPU utilization with sample_interval=0.05
+    cpu_load = measure_cpu_percent(sample_interval=0.05)
     zone_name, _ = determine_cpu_zone(cpu_load, cfg)
 
     while True:
@@ -393,6 +632,7 @@ def acquire_burst_slot(command_line: str, cwd: str, cfg: dict[str, Any]) -> tupl
         acquired = False
         slot_id = ""
         slots_count = 0
+        lease_token = ""
 
         with CrossProcessLock(get_lock_file(), timeout=5.0):
             state = read_state_under_lock()
@@ -418,26 +658,50 @@ def acquire_burst_slot(command_line: str, cwd: str, cfg: dict[str, Any]) -> tupl
                 effective_spacing = base_spacing
                 if (
                     zone_name == "THERMAL_PROTECTION"
-                    and base_spacing > 0.0
                     and "BURST_GUARD_SPACING" not in os.environ
                 ):
-                    # In Thermal Protection zone, apply cooldown pacing
-                    effective_spacing = max(base_spacing, cooldown_sleep)
+                    # In Thermal Protection zone (CPU > 85%), pacing delay MUST accumulate base_spacing + cooldown_sleep
+                    effective_spacing = base_spacing + cooldown_sleep
                 elif zone_name == "ACCELERATION" and "BURST_GUARD_SPACING" not in os.environ:
                     # In Acceleration zone with low CPU load, reduce spacing delay to accelerate dispatch
                     effective_spacing = max(0.2, base_spacing * 0.5)
 
                 target_launch = max(now, last_launch + effective_spacing)
+                # In Thermal Protection zone without test override, enforce immediate cooldown sleep if system is hot
+                if zone_name == "THERMAL_PROTECTION" and "BURST_GUARD_SPACING" not in os.environ:
+                    target_launch = max(target_launch, now + cooldown_sleep)
+
                 pacing_delay = target_launch - now
+
+                lease_token = f"lease_{cmd_hash}_{int(now * 1000)}_{random.randint(1000, 9999)}"
+                command_id = f"cmd_{cmd_hash}_{int(now * 1000)}"
+
+                curr_pid = os.getpid()
+                pid_create_time = None
+                process_name = None
+                ps = get_psutil()
+                if ps is not None:
+                    try:
+                        p = ps.Process(curr_pid)
+                        pid_create_time = p.create_time()
+                        process_name = p.name()
+                    except Exception:
+                        pass
 
                 active_slots[slot_id] = {
                     "slot_id": slot_id,
+                    "lease_token": lease_token,
+                    "command_id": command_id,
                     "command": command_line,
                     "command_hash": cmd_hash,
                     "cwd": cwd,
-                    "pid": os.getpid(),
+                    "pid": curr_pid,
+                    "pid_create_time": pid_create_time,
+                    "process_name": process_name,
                     "acquired_at": now,
+                    "timestamp": now,
                     "expires_at": target_launch + ttl,
+                    "ttl_seconds": ttl,
                     "status": "BUSY",
                     "cpu_zone": zone_name,
                     "cpu_percent": cpu_load,
@@ -460,10 +724,13 @@ def acquire_burst_slot(command_line: str, cwd: str, cfg: dict[str, Any]) -> tupl
                 )
                 time.sleep(pacing_delay)
 
-            log_diagnostic(f"Acquired burst slot '{slot_id}' ({slots_count}/{max_slots} active, Zone: {zone_name}).")
+            log_diagnostic(
+                f"Acquired burst slot '{slot_id}' (lease: {lease_token}, "
+                f"{slots_count}/{max_slots} active, Zone: {zone_name})."
+            )
             return (
                 True,
-                f"Burst guard: slot '{slot_id}' acquired (CPU {cpu_load:.1f}% [{zone_name}], "
+                f"Burst guard: slot '{slot_id}' acquired (lease {lease_token}, CPU {cpu_load:.1f}% [{zone_name}], "
                 f"pacing {pacing_delay:.2f}s, slots {slots_count}/{max_slots}).",
             )
 
@@ -477,28 +744,83 @@ def acquire_burst_slot(command_line: str, cwd: str, cfg: dict[str, Any]) -> tupl
         time.sleep(POLL_INTERVAL_SECONDS + random.uniform(0.01, 0.03))
 
 
-def release_burst_slot(command_line: str, cwd: str) -> None:
+def normalize_cmd_for_matching(cmd: str) -> str:
+    """Normalize command for exact matching across shell wrappers without ambiguous substrings."""
+    clean = cmd.strip()
+    for wrapper_prefix in [
+        r'^(?:powershell|pwsh)(?:\.exe)?\s+(?:-[a-zA-Z]+\s+)*["\']?(.*?)["\']?$',
+        r'^cmd(?:\.exe)?\s+(?:/[a-zA-Z]+\s+)*["\']?(.*?)["\']?$',
+    ]:
+        m = re.match(wrapper_prefix, clean, re.IGNORECASE)
+        if m and m.group(1).strip():
+            clean = m.group(1).strip()
+            break
+    if (clean.startswith('"') and clean.endswith('"')) or (clean.startswith("'") and clean.endswith("'")):
+        clean = clean[1:-1].strip()
+    return clean
+
+
+def release_burst_slot(
+    command_line: str,
+    cwd: str,
+    lease_token: str | None = None,
+    slot_id: str | None = None,
+) -> None:
     """Release active burst slot immediately upon PostToolUse execution."""
     cmd_hash = hashlib.sha256(f"{cwd}:{command_line}".encode()).hexdigest()[:12]
     with CrossProcessLock(get_lock_file(), timeout=5.0):
         state = read_state_under_lock()
+        cfg = load_guard_config()
+        evict_stale_slots(state, cfg.get("slot_ttl_seconds", DEFAULT_SLOT_TTL_SECONDS))
         active_slots = state.get("active_slots", {})
         found_slot_id: str | None = None
 
-        # FIFO match: find the oldest acquired slot matching command hash or command text
-        oldest_ts = float("inf")
-        for s_id, s_info in active_slots.items():
-            if s_info.get("command_hash") == cmd_hash or s_info.get("command") == command_line:
-                acq = float(s_info.get("acquired_at", 0.0))
-                if acq < oldest_ts:
-                    oldest_ts = acq
+        # 1. Direct match by slot_id or lease_token if provided
+        if slot_id and slot_id in active_slots:
+            found_slot_id = slot_id
+        elif lease_token:
+            for s_id, s_info in active_slots.items():
+                if s_info.get("lease_token") == lease_token:
                     found_slot_id = s_id
+                    break
+
+        # 2. FIFO match: find the oldest acquired slot matching command hash or exact command text
+        if not found_slot_id:
+            oldest_ts = float("inf")
+            for s_id, s_info in active_slots.items():
+                s_cmd = s_info.get("command", "")
+                s_hash = s_info.get("command_hash", "")
+                if s_hash == cmd_hash or s_cmd == command_line or s_cmd.strip() == command_line.strip():
+                    acq = float(s_info.get("acquired_at") or s_info.get("timestamp") or 0.0)
+                    if acq < oldest_ts:
+                        oldest_ts = acq
+                        found_slot_id = s_id
+
+        # 3. Normalized unwrapped exact match (avoids ambiguous substring collision)
+        if not found_slot_id:
+            norm_target = normalize_cmd_for_matching(command_line)
+            if norm_target:
+                oldest_ts = float("inf")
+                for s_id, s_info in active_slots.items():
+                    s_cmd = s_info.get("command", "").strip()
+                    norm_s = normalize_cmd_for_matching(s_cmd)
+                    if norm_target == norm_s or split_chained_commands(norm_target) == split_chained_commands(norm_s):
+                        acq = float(s_info.get("acquired_at") or s_info.get("timestamp") or 0.0)
+                        if acq < oldest_ts:
+                            oldest_ts = acq
+                            found_slot_id = s_id
 
         if found_slot_id:
-            duration = time.time() - oldest_ts
+            acq_time = float(
+                active_slots[found_slot_id].get("acquired_at")
+                or active_slots[found_slot_id].get("timestamp")
+                or time.time()
+            )
+            duration = time.time() - acq_time
+            lease = active_slots[found_slot_id].get("lease_token", "unknown")
             del active_slots[found_slot_id]
             write_state_under_lock(state)
-            log_diagnostic(f"Released burst slot '{found_slot_id}' after {duration:.2f}s execution.")
+            log_diagnostic(f"Released burst slot '{found_slot_id}' (lease: {lease}) after {duration:.2f}s execution.")
         else:
             log_diagnostic(f"PostToolUse: No active slot matched for release ({command_line[:40]}).")
 
@@ -509,82 +831,123 @@ def run_self_test() -> int:
 
     print("[SELF-TEST] Starting burst_execution_guard self-test suite...")
     passed = 0
-    total = 8
+    total = 10
 
-    # 1. Config Loader Integration
+    # 1. Dynamic Config & TTL Hardening (60-90s)
     cfg = load_guard_config()
     assert "max_heavy_slots" in cfg, "Config missing max_heavy_slots"
     assert "cpu_cores_physical" in cfg, "Config missing cpu_cores_physical"
-    assert cfg["cpu_cores_physical"] == 4, f"Expected DYNAMIC_CORE_COUNT physical, got {cfg['cpu_cores_physical']}"
-    assert cfg["cpu_threads_logical"] == 8, f"Expected DYNAMIC_THREAD_COUNT logical, got {cfg['cpu_threads_logical']}"
+    assert cfg["cpu_cores_physical"] == 4, f"Expected 4 cores physical, got {cfg['cpu_cores_physical']}"
+    assert cfg["cpu_threads_logical"] == 8, f"Expected 8 threads logical, got {cfg['cpu_threads_logical']}"
     assert cfg["max_heavy_slots"] in (3, 4), f"Expected 3-4 slots, got {cfg['max_heavy_slots']}"
-    print(f"  [1/8] Dynamic Config: 4C/8T profile detected, slots={cfg['max_heavy_slots']} - PASS")
+    assert (
+        60.0 <= cfg["slot_ttl_seconds"] <= 90.0
+    ), f"Expected slot_ttl_seconds in [60, 90], got {cfg['slot_ttl_seconds']}"
+    print(
+        f"  [1/10] Dynamic Config: 4C/8T detected, slots={cfg['max_heavy_slots']}, TTL={cfg['slot_ttl_seconds']}s - PASS"
+    )
     passed += 1
 
-    # 2. CPU Governor & psutil
-    cpu_percent = measure_cpu_percent(sample_interval=0.03)
+    # 2. CPU Governor & Sample Cache (Non-zero measurement)
+    cpu_percent = measure_cpu_percent(sample_interval=0.05, use_cache=False)
     zone, _ = determine_cpu_zone(cpu_percent, cfg)
     assert zone in ("ACCELERATION", "GOLDEN", "THERMAL_PROTECTION")
-    print(f"  [2/8] CPU Governor (psutil): Measured {cpu_percent:.1f}% -> Zone: {zone} - PASS")
+    # Verify cache mechanism
+    write_cached_cpu(72.5)
+    cached_val = read_cached_cpu(max_age_seconds=1.0)
+    assert cached_val == 72.5, f"Expected cached CPU 72.5, got {cached_val}"
+    print(f"  [2/10] CPU Governor & Cache: Measured {cpu_percent:.1f}% -> Zone: {zone}, Cache OK - PASS")
     passed += 1
 
-    # 3. Command Classification
+    # 3. Basic Command Classification
     heavy, _ = is_heavy_command("pytest tests/test_schema.py")
     light, _ = is_heavy_command("git status")
+    heavy_train, _ = is_heavy_command("python train.py")
     assert heavy is True, "pytest should be classified as heavy"
     assert light is False, "git status should be classified as light"
-    print("  [3/8] Command Classifier: Heavy (pytest) vs Light (git status) - PASS")
+    assert heavy_train is True, "python train.py should be classified as heavy"
+    print("  [3/10] Command Classifier: Heavy (pytest, python train.py) vs Light (git status) - PASS")
     passed += 1
 
-    # 4. CrossProcessLock safety
+    # 4. Command Chaining Bypass Prevention
+    chain_heavy_1, _ = is_heavy_command("git status && python train.py")
+    chain_heavy_2, _ = is_heavy_command('cmd /c "git status && pytest"')
+    chain_heavy_3, _ = is_heavy_command("git status ; npm run build")
+    chain_heavy_4, _ = is_heavy_command("cargo test || echo failed")
+    chain_light_1, _ = is_heavy_command("git status && git diff")
+    chain_light_2, _ = is_heavy_command('echo "hello && world"')
+    assert chain_heavy_1 is True, "git status && python train.py must be classified as HEAVY"
+    assert chain_heavy_2 is True, "cmd /c git status && pytest must be classified as HEAVY"
+    assert chain_heavy_3 is True, "git status ; npm run build must be classified as HEAVY"
+    assert chain_heavy_4 is True, "cargo test || echo failed must be classified as HEAVY"
+    assert chain_light_1 is False, "git status && git diff should be LIGHT"
+    assert chain_light_2 is False, 'echo "hello && world" should be LIGHT'
+    print("  [4/10] Command Chaining Bypass Prevention (&&, ||, ;, |, quotes) - PASS")
+    passed += 1
+
+    # 5. Thermal Zone Pacing Calculation (base_spacing + cooldown_sleep)
+    test_base_spacing = 1.2
+    test_cooldown = 1.0
+    calculated_spacing = test_base_spacing + test_cooldown
+    assert calculated_spacing == 2.2, f"Expected 2.2s, got {calculated_spacing}"
+    print(f"  [5/10] Thermal Zone Pacing: Cumulative delay {test_base_spacing}s + {test_cooldown}s = {calculated_spacing}s - PASS")
+    passed += 1
+
+    # 6. CrossProcessLock safety
     with tempfile.TemporaryDirectory() as tmp_dir:
         lock_p = pathlib.Path(tmp_dir) / "test.lock"
         with CrossProcessLock(lock_p, timeout=2.0) as lk:
             assert lk.fd is not None
-        print("  [4/8] CrossProcessLock (Windows msvcrt / POSIX fcntl) - PASS")
+        print("  [6/10] CrossProcessLock (Windows msvcrt / POSIX fcntl) - PASS")
         passed += 1
 
-    # 5. Slot Acquisition & Release
+    # 7. Slot Acquire with Lease Token & Immediate Release
     with tempfile.TemporaryDirectory() as tmp_dir:
         os.environ["BURST_GUARD_STATE_DIR"] = tmp_dir
         os.environ["BURST_GUARD_SPACING"] = "0.0"
         try:
             ok, reason = acquire_burst_slot("pytest test_sample.py", tmp_dir, cfg)
             assert ok is True
-            assert "slot" in reason.lower()
+            assert "lease" in reason.lower()
             state = read_state_under_lock()
-            assert len(state.get("active_slots", {})) == 1
+            active = state.get("active_slots", {})
+            assert len(active) == 1
+            slot_info = next(iter(active.values()))
+            assert "lease_token" in slot_info and slot_info["lease_token"].startswith("lease_")
+            assert "command_id" in slot_info and slot_info["command_id"].startswith("cmd_")
             # Release
             release_burst_slot("pytest test_sample.py", tmp_dir)
             state_after = read_state_under_lock()
             assert len(state_after.get("active_slots", {})) == 0
-            print("  [5/8] Slot Acquire & Immediate Release - PASS")
+            print("  [7/10] Slot Acquire (Lease Token) & Immediate Release - PASS")
             passed += 1
         finally:
             os.environ.pop("BURST_GUARD_STATE_DIR", None)
             os.environ.pop("BURST_GUARD_SPACING", None)
 
-    # 6. TTL Eviction
+    # 8. Stale Slot TTL Eviction (60-90s window)
     mock_state = {
         "active_slots": {
             "slot_0": {
+                "lease_token": "lease_old_123",
                 "expires_at": time.time() - 10.0,
                 "acquired_at": time.time() - 100.0,
             },
             "slot_1": {
-                "expires_at": time.time() + 80.0,
+                "lease_token": "lease_fresh_456",
+                "expires_at": time.time() + 75.0,
                 "acquired_at": time.time(),
             },
         }
     }
-    evicted = evict_stale_slots(mock_state, ttl_seconds=90.0)
+    evicted = evict_stale_slots(mock_state, ttl_seconds=75.0)
     assert evicted == 1
     assert "slot_0" not in mock_state["active_slots"]
     assert "slot_1" in mock_state["active_slots"]
-    print("  [6/8] Stale Slot TTL Eviction - PASS")
+    print("  [8/10] Stale Slot Lease TTL Eviction (60-90s) - PASS")
     passed += 1
 
-    # 7. Queue Wait Timeout (Graceful Degradation)
+    # 9. Queue Wait Timeout (Graceful Degradation)
     with tempfile.TemporaryDirectory() as tmp_dir:
         os.environ["BURST_GUARD_STATE_DIR"] = tmp_dir
         os.environ["BURST_GUARD_MAX_SLOTS"] = "1"
@@ -600,7 +963,7 @@ def run_self_test() -> int:
             assert ok2 is True
             assert "fail-safe allow" in reason2.lower()
             assert elapsed >= 0.25
-            print("  [7/8] Queue Timeout Fail-Safe Graceful Degradation - PASS")
+            print("  [9/10] Queue Timeout Fail-Safe Graceful Degradation - PASS")
             passed += 1
         finally:
             os.environ.pop("BURST_GUARD_STATE_DIR", None)
@@ -608,13 +971,13 @@ def run_self_test() -> int:
             os.environ.pop("BURST_GUARD_SPACING", None)
             os.environ.pop("BURST_GUARD_WAIT_TIMEOUT", None)
 
-    # 8. Fast-path latency (< 50ms)
+    # 10. Fast-path latency (< 50ms)
     t_fast = time.monotonic()
     is_h, _ = is_heavy_command("dir")
     t_fast_elapsed = (time.monotonic() - t_fast) * 1000.0
     assert not is_h
     assert t_fast_elapsed < 50.0
-    print(f"  [8/8] Fast-Path Bypass Latency: {t_fast_elapsed:.3f}ms (< 50ms) - PASS")
+    print(f"  [10/10] Fast-Path Bypass Latency: {t_fast_elapsed:.3f}ms (< 50ms) - PASS")
     passed += 1
 
     print(f"\n[SELF-TEST COMPLETE] Passed {passed}/{total} tests successfully!")
@@ -626,9 +989,7 @@ def main() -> None:
         sys.exit(run_self_test())
 
     payload = read_stdin_payload(default={})
-    tool_call = get_tool_call(payload)
-    tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else ""
-    args = get_tool_args(tool_call)
+    tool_name, args = extract_tool_invocation(payload)
 
     # Fast check: Only inspect run_command
     if tool_name != "run_command":

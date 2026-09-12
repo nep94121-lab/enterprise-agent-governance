@@ -11,10 +11,10 @@ import importlib.util
 import pytest
 
 # Load cvss_calculator module directly to avoid hooks_scripts/__init__.py dependencies
-spec = importlib.util.spec_from_file_location(
-    "cvss_calculator",
-    str(Path(__file__).resolve().parent.parent / "hooks_scripts" / "cvss_calculator.py")
-)
+_cvss_path = Path(__file__).resolve().parent.parent / "hooks" / "hooks_scripts" / "cvss_calculator.py"
+if not _cvss_path.exists():
+    _cvss_path = Path(__file__).resolve().parent.parent / "hooks_scripts" / "cvss_calculator.py"
+spec = importlib.util.spec_from_file_location("cvss_calculator", str(_cvss_path))
 cvss_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cvss_module)
 
