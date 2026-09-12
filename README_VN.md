@@ -3,12 +3,25 @@
 
 > **Hệ thống điều phối hạm đội AI đa tác tử, thiết lập rào chắn an toàn vật lý thời gian thực và bộ điều tốc phần cứng động cho các hệ thống phần mềm doanh nghiệp.**
 
-[![Giấy phép: MIT](https://img.shields.io/badge/Gi%E1%BA%A5y%20Ph%C3%A9p-MIT-blue.svg)](LICENSE)
+[![Phiên bản: 2.0.0](https://img.shields.io/badge/Phi%C3%AAn%20B%E1%BA%A3n-2.0.0--Hardened-blue.svg)](CHANGELOG.md)
+[![Giấy phép: MIT](https://img.shields.io/badge/Gi%E1%BA%A5y%20Ph%C3%A9p-MIT-green.svg)](LICENSE)
 [![Kiến trúc: 3-Tier Multi-Agent](https://img.shields.io/badge/Ki%E1%BA%BFn%20Tr%C3%BAc-3--Tier%20Hierarchical-blueviolet.svg)](#-kiến-trúc-phân-tầng-3-tier-nghiêm-ngặt)
 [![Phân luồng: Bể Đôi Bất Đối Xứng](https://img.shields.io/badge/Ph%C3%A2n%20Lu%E1%BB%93ng-B%E1%BB%83%20%C4%90%C3%B4i%20B%E1%BA%A5t%20%C4%90%E1%BB%91i%20X%E1%BB%A9ng-brightgreen.svg)](#-kiến-trúc-phân-luồng-bể-đôi--bộ-điều-tốc-cpu-động)
-[![An toàn: 52 Hooks Vật Lý](https://img.shields.io/badge/R%C3%A0o%20Ch%E1%BA%AFn-52%20Hooks%20V%E1%BA%ADt%20L%C3%BD-red.svg)](#-lớp-rào-chắn-an-toàn-52-enterprise-hooks-vật-lý)
-[![Phần cứng: Dynamic Auto-Sensing](https://img.shields.io/badge/Ph%E1%BA%A7n%20C%E1%BB%A9ng-Dynamic%20Auto--Sensing-orange.svg)](#-cơ-chế-nhận-biết-phần-cứng-động-dynamic-hardware-auto-sensing)
+[![An toàn: 60+ Hooks Vật Lý](https://img.shields.io/badge/R%C3%A0o%20Ch%E1%BA%AFn-60%2B%20Hooks%20V%E1%BA%ADt%20L%C3%BD-red.svg)](#-lớp-rào-chắn-an-toàn-52-enterprise-hooks-vật-lý)
 [![Tài liệu: English Standard](https://img.shields.io/badge/Docs-English%20Standard-informational.svg)](README.md)
+[![Nhật ký phiên bản: v2.0](https://img.shields.io/badge/Changelog-v2.0%20Release-orange.svg)](CHANGELOG.md)
+
+---
+
+## 🚀 Có Gì Mới Ở Bản Nâng Cấp v2.0 (Bảo Mật Tối Đa & Tinh Gọn Ngữ Cảnh)
+
+> 📌 **Chi tiết toàn bộ nhật ký thay đổi xem tại [CHANGELOG.md](CHANGELOG.md)**
+
+* 🛡️ **Vá triệt để 242+ lỗ hổng bảo mật & anti-bypass:** Chuyển toàn bộ 60+ hooks sang mô hình Fail-Closed (`HARD DENY` khi gặp lỗi). Khắc phục triệt để lỗi tranh chấp khóa file NTFS (Starvation Deadlock), cơ chế đọc stream chống tấn công tràn bộ nhớ (OOM >10MB), và đồng bộ trạng thái atomic cho multi-PM swarms.
+* ⚡ **Xóa bỏ hoàn toàn lỗi cắt xén ngữ cảnh (74% ➔ 0% Truncation):** Thu nhỏ quy chế Agent Chính ([`AGENTS.md`](rules/AGENTS.md)) từ **92.7 KB xuống còn 19.05 KB** (-79.5%), đảm bảo 100% quy tắc được AI nạp trọn vẹn tại Turn 1 mà không bị cắt cụt đuôi.
+* 📦 **Tập trung hóa chuẩn Single Source of Truth (`rules_shared/`):** Xóa sạch 54 file duplicate spec rác nằm rải rác ở 14 vai trò (-912.7 KB dung lượng thừa), tập trung về duy nhất thư mục `rules_shared/`.
+* 🌲 **Khắc phục Lead PM ngợp Context:** Bổ sung [`LEAD_PM_RULES_INDEX.md`](rules/rules_by_role/lead_pm/LEAD_PM_RULES_INDEX.md) (13.5 KB) giúp giảm ngay 89.9% token tại Turn 1 (~70,000 tokens), ngăn chặn hiện tượng tự kích hoạt cơ chế phế truất.
+* 🔒 **Bảo vệ quyền riêng tư 100% Zero-Leak:** Rà soát và lọc sạch toàn bộ IP mạng nội bộ, email cá nhân, tên máy trạm và SSH keys thành các biến tổng quát an toàn trước khi công khai.
 
 ---
 

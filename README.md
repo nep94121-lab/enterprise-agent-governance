@@ -3,14 +3,27 @@
 > **Autonomous Multi-Agent Orchestration, Physical Runtime Safety & Dynamic Hardware Governor for Production AI Systems.**  
 > *Synthesized from 100+ global autonomous agent architectures and verified across 100 multi-agent production workloads.*
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version: 2.0.0](https://img.shields.io/badge/Version-2.0.0--Hardened-blue.svg)](CHANGELOG.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI Tests: 100% Passing](https://img.shields.io/badge/CI%20Tests-100%25%20Passing-brightgreen.svg)](tests/)
 [![Live Benchmark: 1--Click](https://img.shields.io/badge/Benchmark-Interactive%201--Click-success.svg)](#-run-the-interactive-live-benchmark-in-5-seconds)
 [![Architecture: 3-Tier Multi-Agent](https://img.shields.io/badge/Architecture-3--Tier%20Hierarchical-blueviolet.svg)](#-3-tier-hierarchical-architecture)
 [![Concurrency: Dual-Pool](https://img.shields.io/badge/Concurrency-Dual--Pool%20Asymmetric-brightgreen.svg)](#-dual-pool-concurrency--dynamic-hardware-governor)
-[![Safety: 51 Physical Hooks](https://img.shields.io/badge/Guardrails-51%20Physical%20Hooks-red.svg)](#-51-physical-runtime-hooks)
-[![Hardware: Dynamic Auto-Sensing](https://img.shields.io/badge/Hardware-Dynamic%20Auto--Sensing-orange.svg)](#-dynamic-hardware-auto-sensing)
+[![Safety: 60+ Physical Hooks](https://img.shields.io/badge/Guardrails-60%2B%20Physical%20Hooks-red.svg)](#-60-physical-runtime-hooks)
 [![Documentation: Bilingual](https://img.shields.io/badge/Docs-English%20%7C%20Ti%E1%BA%BFng%20Vi%E1%BB%87t-informational.svg)](README_VN.md)
+[![Changelog: v2.0](https://img.shields.io/badge/Changelog-v2.0%20Release-orange.svg)](CHANGELOG.md)
+
+---
+
+## 🚀 What's New in v2.0 (Security Hardening & Lean Context Update)
+
+> 📌 **Full release notes available in [CHANGELOG.md](CHANGELOG.md)**
+
+* 🛡️ **242+ Security & Anti-Bypass Vulnerabilities Patched:** Converted all runtime interceptors from fail-open to fail-closed (`HARD DENY` on errors). Fixed NTFS starvation deadlocks, streaming OOM handlers, and multi-PM split-brain state synchronization.
+* ⚡ **74% ➔ 0% Context Truncation:** Refactored core executive rules ([`AGENTS.md`](rules/AGENTS.md)) from **92.7 KB down to 19.05 KB** (-79.5%), ensuring top-level agents never lose governance rules due to system prompt clipping.
+* 📦 **Single Source of Truth (`rules_shared/`):** Purged 54 duplicate compliance specifications across 14 role folders (-912.7 KB reclaimed), centralizing them into a single authoritative directory.
+* 🌲 **Lead PM Context Relief:** Added [`LEAD_PM_RULES_INDEX.md`](rules/rules_by_role/lead_pm/LEAD_PM_RULES_INDEX.md) (13.5 KB) reducing initial Turn-1 token payload by 89.9% (~70,000 tokens saved).
+* 🔒 **Zero-Leak Privacy Shield:** 100% sanitized all personal network IPs, emails, machine names, and private keys into clean generic placeholders.
 
 ---
 

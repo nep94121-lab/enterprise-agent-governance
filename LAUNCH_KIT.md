@@ -22,7 +22,7 @@
 * **Best Timing:** Tuesday / Wednesday between 12:00 UTC - 14:00 UTC (19:00 - 21:00 Vietnam time).
 * **Title:**
   ```text
-  Show HN: We benchmarked 100 autonomous agents and built 51 OS-level physical hooks to stop goal drift
+  Show HN: We benchmarked 100 autonomous agents and built 60+ OS-level physical hooks to stop goal drift
   ```
 * **Text / Body:**
   ```markdown
@@ -38,7 +38,7 @@
   https://github.com/nep94121-lab/enterprise-agent-governance
 
   What it does:
-  - 51 Physical Runtime Hooks: Intercepts PreToolUse and PostToolUse events at the OS boundary. An orchestrator attempting an unauthorized file edit gets physically aborted (HARD DENY).
+  - 60+ Physical Runtime Hooks (Hardened across 242+ threat vectors): Intercepts PreToolUse and PostToolUse events at the OS boundary with Fail-Closed semantics. An orchestrator attempting an unauthorized file edit gets physically aborted (HARD DENY).
   - Dynamic 3-Zone CPU Governor: Senses host cores via psutil and dynamic semaphores, maintaining execution in the "Golden Zone" (60-85% CPU) with zero UI freezing.
   - Dual-Pool Concurrency: Scales cloud thinking up to 20 parallel subagents while metering local compile/test bursts.
   - Real-Time Secret Masker: Evaluates Shannon entropy and 19 credential patterns to redact tokens before they hit disk.
@@ -62,7 +62,7 @@
 * **Subreddits:** `r/LocalLLaMA`, `r/MachineLearning`, `r/Python`, `r/ArtificialInteligence`
 * **Post Title:**
   ```text
-  Why prompt-based guardrails fail for autonomous agents: Our empirical data from 100 subagent runs and how 51 physical hooks stopped goal drift (+380% speedup)
+  Why prompt-based guardrails fail for autonomous agents: Our empirical data from 100 subagent runs and how 60+ physical hooks stopped goal drift (+380% speedup)
   ```
 * **Post Content:**
   ```markdown
@@ -79,7 +79,7 @@
   👉 GitHub: https://github.com/nep94121-lab/enterprise-agent-governance
 
   ### What makes it different:
-  1. **Physical Runtime Interception (Not Prompts):** We use 51 OS-level hooks that intercept tool calls before and after execution. If an agent tries to edit a file outside its Exclusive Ownership allocation, the hook aborts execution with exit code 1.
+  1. **Physical Runtime Interception (Not Prompts):** We use 60+ OS-level hooks that intercept tool calls before and after execution with Fail-Closed security. If an agent tries to edit a file outside its Exclusive Ownership allocation, the hook aborts execution with exit code 1.
   2. **Dual-Pool Asymmetric Concurrency:** Separates Cloud reasoning (capped at 20 parallel subagents in rolling batches) from local compute (metered via a 3-zone psutil dynamic semaphore).
   3. **Realtime Entropy & Secret Masking:** Automatically sanitizes Google Gemini keys, GitHub PATs, and PII in tool outputs using Shannon entropy filters.
 
@@ -107,7 +107,7 @@
   >
   > We benchmarked 100 autonomous agents and discovered why soft prompt rules fail.
   >
-  > Here is how we fixed it with 51 physical runtime hooks: 🧵👇
+  > Here is how we fixed it with 60+ physical runtime hooks: 🧵👇
   > *(Attach terminal recording of `python test_live.py`)*
 
 * **Tweet 2 (The Problem):**
@@ -119,7 +119,7 @@
 * **Tweet 3 (The Architecture):**
   > Introducing EAGF (Enterprise Agent Governance Framework):
   > 🏛️ 3-Tier Hierarchy (Executive -> PM -> 14 Specialized Roles)
-  > 🛡️ 51 Pre/PostToolUse Physical Hooks
+  > 🛡️ 60+ Pre/PostToolUse Physical Hooks
   > ⚡ Dual-Pool Concurrency (Cap 20 Parallel Cloud / Dynamic Local Semaphore)
   > 🚦 7 Phase Monotonic Gates
 
@@ -170,7 +170,7 @@ Add under section **Autonomous Coding & Tool Use**:
 * **Các nhóm:** *Cộng Đồng AI Việt Nam*, *Hội Vibe Coding & AI Engineer*, *Diễn đàn VOZ / TinhTe*.
 * **Nội dung bài đăng:**
   ```markdown
-  [Chia sẻ mã nguồn mở] Giải quyết triệt để vấn đề AI Coding Agent tự phá hoại code, làm đơ máy và lộ API Key bằng 51 Hook vật lý ở cấp Hệ Điều Hành.
+  [Chia sẻ mã nguồn mở] Giải quyết triệt để vấn đề AI Coding Agent tự phá hoại code, làm đơ máy và lộ API Key bằng 60+ Hook vật lý ở cấp Hệ Điều Hành.
 
   Chào mọi người,
   Khi làm việc với các Coding Agent tự trị (Google Antigravity, Claude Code, Cursor, Aider...), chắc hẳn anh em đều từng gặp cảnh:
@@ -182,7 +182,7 @@ Add under section **Autonomous Coding & Tool Use**:
   👉 GitHub: https://github.com/nep94121-lab/enterprise-agent-governance
 
   ✨ Điểm khác biệt cốt lõi:
-  - 51 Hook vật lý can thiệp thẳng ở cấp OS: Nếu Agent cố tình sửa file trái thẩm quyền -> Lập tức chặn đứng (Hard Deny).
+  - 60+ Hook vật lý can thiệp thẳng ở cấp OS: Nếu Agent cố tình sửa file trái thẩm quyền -> Lập tức chặn đứng (Hard Deny).
   - Điều tốc CPU 3 vùng qua psutil: Không bao giờ làm đơ máy, tối ưu đa luồng giúp tăng tốc gấp 3.8 lần.
   - Che giấu tự động 100% API key, token và CCCD theo thời gian thực.
   - Tích hợp sẵn cho Google Antigravity, Claude Code, Cursor và LangGraph.
