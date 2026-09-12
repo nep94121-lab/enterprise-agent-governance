@@ -134,9 +134,10 @@ Khi có task kỹ thuật (task ≥ 2 bước), Agent Chính ủy quyền theo n
 2. **Khởi Tạo PM Sub-Agent (Lead PM vs PM Thường):**
    - **Trường hợp A — Kích hoạt `/leadpm` (CHỈ khi Sếp gõ `/leadpm`):**
      * Vai trò: **Lead PM (Tier 1.5 - Chief Meta-Orchestrator)** | Model: **Pro** | TypeName: `pm_orchestrator`.
-     * Rules: `rules/enterprise-hooks/rules_by_role/lead_pm/LEAD_PM_RULES.md`.
+     * Rules: `rules/rules_by_role/lead_pm/LEAD_PM_RULES_INDEX.md`.
      * Canary: `CANARY_VERIFIED: §PM-ROLE-BOUNDARY` (hoặc `§LEAD-PM-META-ORCHESTRATOR`).
      * Trách nhiệm: Phân rã 5–10 Domains, Interface Freeze Gate, Dynamic Quota Slicing (tổng Cap 20), điều phối PM con (Tier 2), Gate 6.5 System Integration.
+     * **BẤT BIẾN QUY MÔ:** Tổng số subagents tích lũy sinh ra xuyên suốt toàn bộ dự án `/leadpm` **KHÔNG ĐƯỢC DƯỚI 100 CON ($\ge 100$ Subagents)**. Hook `lead_pm_minimum_agent_enforcer.py` tự động cưỡng chế chặn cứng (HARD DENY) mọi hành vi kết thúc sớm khi chưa đạt đủ 100 subagents!
    - **Trường hợp B — Kích hoạt `/pm` hoặc Task Kỹ Thuật Vừa/Nhỏ (Single Domain / 2-Tier):**
      * Vai trò: **PM Thường (Tier 2 - Project Orchestrator)** | Model: **Flash** (`thinking_level="high"`) / **Pro** | TypeName: `pm_orchestrator`.
      * Rules: `rules/enterprise-hooks/rules_by_role/pm_orchestrator/PM_RULES.md`.

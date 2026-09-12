@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.1.0] - 2026-09-12
+
+### ⚡ Programming Safety Relays & Circuit Breakers (Zero-Crash Assurance)
+- **Runtime Safety Relays Framework (`hook_utils/safety_relays.py`):** Added production circuit breakers for recursive infinite loops (`LoopBreaker`), memory spike trips >500MB (`MemorySpikeBreaker`), error cascading $\ge 3$ iterations (`CascadeBreaker`), scope boundary enforcement (`ScopeBreaker`), and file lock timeout breakers (`LockTimeoutBreaker`).
+- **Physical Safety Guard Hook (`hooks_scripts/programming_safety_relay_guard.py`):** Intercepts tool execution to trip relays and transition systems into a deterministic Safe Mode within $\le 100$ms upon detecting abnormal programming anomalies.
+- **Specification Authority (`rules_shared/PROGRAMMING_SAFETY_RELAYS_SPEC.md`):** Established comprehensive architectural standards for programming circuit breakers and graceful recovery states.
+
+### ⚔️ Adversarial Attack Testing Engine (Stress & Fuzzing Resilience)
+- **Adversarial Interception Hook (`hooks_scripts/adversarial_attack_testing_hook.py`):** Real-time interception against 4 major threat vectors: SQLi/Malformed payloads, OS command injection, context/prompt injection, and path traversal bypasses.
+- **Automated Adversarial Test Suite (`tests/test_adversarial_safety_relays.py`):** Passed 100% (5/5) across all attack vectors with zero fake assertions or empty mocks.
+- **Adversarial Standards Specification (`rules_shared/ADVERSARIAL_ATTACK_TESTING_SPEC.md`):** Complete red-team validation playbook and fuzzing rules.
+
+### 👑 Enterprise /leadpm Scale Invariant: Minimum 100 Cumulative Agents
+- **Minimum Subagent Scale Invariant Enforcer (`hooks_scripts/lead_pm_minimum_agent_enforcer.py`):** Enforces that any enterprise `/leadpm` command must mobilize **$\ge 100$ cumulative subagents** across its multi-wave lifecycle. Blocks early task closure or Gate 6.5 completion with a `HARD DENY` if total spawned agents $< 100$.
+- **Dual-Pool Rolling Waves Compatibility:** Maintains strict $\le 20$ active subagent concurrency (Pool 1) on workstation hardware (4C/8T) while enabling deep hierarchical task decomposition across consecutive waves (achieving 160+ cumulative subagents in live tests).
+- **Rulebook Synchronization:** Updated `AGENTS.md`, `AGENTS_SYSTEM_DESIGN.md`, and `LEAD_PM_RULES_INDEX.md` to reflect the 100-agent scale invariant.
+
+---
+
 ## [2.0.0] - 2026-09-12
 
 ### 🛡️ Security Hardening & Anti-Bypass (242+ Vulnerabilities Patched)

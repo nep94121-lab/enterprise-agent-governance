@@ -69,6 +69,19 @@
 
 ---
 
+### 1.3. Bất Biến Quy Mô /leadpm: Tổng Số Agents Tích Lũy Không Được Dưới 100 Con ($\ge 100$ Subagents)
+
+> 🚨 **LỆNH BẤT KHẢ XÂM PHẠM — CẤM DƯỚI 100 SUBAGENTS CHO LỆNH /LEADPM:**
+> 1. **Nguyên Tắc Siêu Doanh Nghiệp (Enterprise Scale):** Lệnh `/leadpm` là cấp điều phối tối cao. Khi lệnh này được kích hoạt, Lead PM BẮT BUỘC phải kiến tạo mạng lưới thực thi sao cho **tổng số subagents tích lũy sinh ra xuyên suốt toàn bộ dự án $\ge 100$ agents**.
+> 2. **Kiến Trúc Điều Tiết Concurrency:**
+>    - Trần đồng thời tức thời (Active Concurrency Cap): Luôn $\le 20$ tác tử active cùng lúc (Bể 1).
+>    - Tổng lượt huy động (Cumulative Throughput): Phân rã bài toán thành nhiều Domain Waves, chia nhỏ thành các cụm Dev Workers, Adversarial Challengers, Pre-Flight Auditors, Watchdog Observers, Refactoring Squads, cuốn chiếu liên tục cho đến khi chạm và vượt ngưỡng 100 agents.
+> 3. **Cơ Chế Rơ-le Giám Sát (Hook `lead_pm_minimum_agent_enforcer.py`):**
+>    - Hệ thống hook vật lý tự động kiểm tra số lượng `invoke_subagent` đã thực hiện.
+>    - CẤM nghiệm thu Gate 6.5 hoặc Phase 7 Handoff nếu tổng số subagents tích lũy $< 100$. Mọi vi phạm đều bị trả về trạng thái `HARD DENY` và buộc tiếp tục mở rộng kiểm thử đối kháng!
+
+---
+
 ## 2. TỔNG HỢP CẤU TRÚC 3 PHẦN QUY TẮC CHUYÊN SÂU (KHO LƯU TRỮ LỊCH SỬ / LEGACY ARCHIVE)
 
 > ⚠️ **CHÚ THÍCH KHO LƯU TRỮ LỊCH SỬ (LEGACY ARCHIVE):**  

@@ -170,4 +170,8 @@ Thẩm định sản phẩm bắt buộc đối soát qua 3 Thước Đo Vật L
    - Bài test benchmark BẮT BUỘC kích hoạt 8 tiến trình worker song song (`ProcessPoolExecutor(max_workers=8)` hoặc `pytest -n 8`).
    - Bằng chứng viễn trắc: Script đo `psutil.cpu_percent(percpu=True)` và in mảng tải của **toàn bộ 8 luồng (Core 0 đến Core 7)**.
    - Tiêu chí: Cả 8 luồng đều có tải thực tế; tổng CPU máy trạm đẩy lên **Vùng Hoàng Kim (60%–85%)** trong ít nhất 5–15 giây. Phát hiện chỉ chạy đơn luồng (single thread, CPU < 20%) $\implies$ **ĐÁNH RỚT TOÀN BỘ**.
+4. **Thước Đo Quy Mô Tác Tử Tích Lũy Cho /leadpm ($\ge 100$ Subagents Cumulative Gate):**
+   - Một khi kích hoạt `/leadpm`, quy mô kiến trúc cấp Enterprise bắt buộc phải phân rã thành mạng lưới sâu với **tổng số subagents tích lũy được huy động $\ge 100$ con**.
+   - Phân bổ qua các đợt Rolling Waves (mỗi đợt $\le 20$ subagents active để không nghẽn máy), luân phiên thay thế và thu hồi quota.
+   - Giám sát bởi hook `lead_pm_minimum_agent_enforcer.py`. Nghiêm cấm đóng task, nghiệm thu Gate 6.5 hoặc Phase 7 khi tổng số agent tích lũy $< 100$.
 </anti_slop_quantitative_scale_protocol>
