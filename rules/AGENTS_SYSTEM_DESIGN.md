@@ -58,9 +58,9 @@ Agent Chính sở hữu 2 chế độ điều phối tùy theo quy mô và yêu 
 [TIER 1] Agent Chính (Top-Level Executive) — Tương tác trực tiếp với Sếp, phân bổ Domain & Quota.
    │
    ├─► [TIER 1.5] Hội Đồng Thẩm Định & Phản Biện Cấp Meta:
-   │     ├─ PM Plan Challenger (Model: Pro) — Phê duyệt Gate 4 (>= 80/100).
-   │     ├─ PM Meta-Auditor (Model: Pro) — Kiểm toán độc lập Gate 7 (>= 90/100).
-   │     └─ Fleet Watchdog (Model: Flash) — Giám sát Cap 20 & Semaphore 3–4 slots.
+   │     ├─ PM Plan Challenger (Model: inherit / pro) — Phê duyệt Gate 4 (>= 80/100).
+   │     ├─ PM Meta-Auditor (Model: inherit / pro) — Kiểm toán độc lập Gate 7 (>= 90/100).
+   │     └─ Fleet Watchdog (Model: inherit / pro) — Giám sát Cap 20 & Semaphore 3–4 slots.
    │
    ├─► [TIER 2] Multi-PM Swarm — Mỗi PM quản trị 1 Domain độc lập qua 7 Phase Gates.
    │
@@ -76,9 +76,9 @@ Agent Chính sở hữu 2 chế độ điều phối tùy theo quy mô và yêu 
 ### 3. Hội Đồng Phản Biện Tier 1.5 (Meta-Governance Panel)
 | Vai Trò | Model | Thời Điểm Kích Hoạt | Trách Nhiệm Cốt Lõi | Chuẩn Thông Qua |
 |---|---|---|---|---|
-| **PM Plan Challenger** | Pro (High Reasoning) | Gate 4 (sau khi PM nộp implementation plan) | Đối soát 5 Trục Meta-Critique (Căn chỉnh yêu cầu, Phân rã nguyên tử, Phân quyền file độc quyền, Ngân sách phần cứng, Độ phủ test) | $\ge 80.0/100$, 0 blocker |
-| **PM Meta-Auditor** | Pro | Gate 7 (sau khi PM nộp handoff report) | Thẩm định thực tế mã nguồn, chạy lại 100% test suite, kiểm tra 10 Tầng Pre-Flight | $\ge 90.0/100$, AUDIT_PASSED |
-| **Fleet Watchdog** | Flash | Chạy liên tục song song | Giám sát Concurrency Cap 20 Bể 1, Semaphore 3–4 slots Bể 2, quét diệt Zombie processes | Zero Deadlock, Zero Overload |
+| **PM Plan Challenger** | `inherit` / `pro` (High Reasoning) | Gate 4 (sau khi PM nộp implementation plan) | Đối soát 5 Trục Meta-Critique (Căn chỉnh yêu cầu, Phân rã nguyên tử, Phân quyền file độc quyền, Ngân sách phần cứng, Độ phủ test) | $\ge 80.0/100$, 0 blocker |
+| **PM Meta-Auditor** | `inherit` / `pro` (High Reasoning) | Gate 7 (sau khi PM nộp handoff report) | Thẩm định thực tế mã nguồn, chạy lại 100% test suite, kiểm tra 10 Tầng Pre-Flight | $\ge 90.0/100$, AUDIT_PASSED |
+| **Fleet Watchdog** | `inherit` / `pro` (High Reasoning) | Chạy liên tục song song | Giám sát Concurrency Cap 20 Bể 1, Semaphore 3–4 slots Bể 2, quét diệt Zombie processes | Zero Deadlock, Zero Overload |
 </multi_pm_meta_governance_protocol>
 
 ---

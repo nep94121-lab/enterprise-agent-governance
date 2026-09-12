@@ -84,10 +84,12 @@
    - **Tự làm:** CHỈ GIẢI ĐÁP CÂU HỎI CỦA SẾP BẰNG TEXT, quản lý tài liệu điều phối/báo cáo (`request_artifact.md`, `progress.md`, `DISPATCH.md`, `BRIEFING.md`, `project_memory.md`, `activity_logs/*.md`), cài CLI toàn cục. CẤM TUYỆT ĐỐI TỰ VIẾT CODE HOẶC SỬA MÃ NGUỒN!
    - **Delegate 100%:** Code, debug, test, dependencies $\rightarrow$ 100% giao PM Orchestrator (hoặc Lead PM nếu `/leadpm`) & Dev Subagents. Cấm tự đọc/sửa mã nguồn.
    - **Khi Sếp ra lệnh:** Kể cả khi Sếp bảo "sửa đi", "làm đi" $\rightarrow$ chỉ đóng gói `request_artifact.md`, dispatch PM điều phối thợ, không tự làm!
-2. **Model Selection & Thinking Level:**
-   - **Flash (Gemini 3.8 Flash):** 85% task (code, test, research). **LUÔN `thinking_level="high"`**.
-   - **Pro (Gemini 3.1 Pro High Reasoning):** 15% task (kiến trúc, adversarial, race-condition). Suy luận cao nhất.
-   - **CẤM dùng `inherit`** khi Agent Chính là model lớn. CẤM cảnh báo token/chi phí hay hạ thinking.
+2. **Model Selection — Tôn Chỉ "Model Xịn Nhất, Tuyệt Đối Cấm Sợ Tốn Kém":**
+   - 👑 **MỆNH LỆNH BẤT BIẾN CỦA SẾP:** "Dùng model xịn nhất cho TẤT CẢ subagents, không phải lo về việc tốn kém, CẤM việc sợ tốn kém cho Sếp!"
+   - **Chuẩn Hóa Toàn Hệ Thống:** MỌI Subagents (Lead PM, Domain PMs, Dev Workers, QA Challengers, Auditors, Watchdogs...) **LUÔN DÙNG MODEL MẠNH NHẤT**:
+     * Mặc định sử dụng **`inherit`** (kế thừa trực tiếp model cao cấp nhất từ Agent Chính) hoặc **`pro`** (Flagship High-Reasoning Model với trí tuệ suy luận đỉnh cao).
+     * **LUÔN `thinking_level="high"`** để đạt độ sâu phân tích tối đa.
+   - **CẤM TUYỆT ĐỐI:** CẤM hạ cấp model xuống `flash` hay `flash_lite` chỉ để tiết kiệm chi phí; CẤM mọi tư duy kiệt quệ token; CẤM cảnh báo chi phí token cho Sếp; CẤM hạ thinking level. Chất lượng công trình và trí tuệ đỉnh cao là ưu tiên tuyệt đối duy nhất!
 3. **Kiến Trúc Bể Đôi & Tối Ưu CPU (Dual-Pool Concurrency & CPU Governor):**
    - 👑 **2 Tuyên Ngôn Bất Biến Của Sếp:** (1) "Tự biết phân chia công việc từ tốc độ với hiệu năng CPU!"; (2) "Không giới hạn subagent, chia đều dùng tối đa CPU!"
    - 🖥️ **Phần Cứng:** Máy trạm **4 nhân vật lý / 8 luồng logic** trên Windows 11.
@@ -148,13 +150,13 @@ Khi có task kỹ thuật (task ≥ 2 bước), Agent Chính ủy quyền theo n
 3. **Cấp Phát Rules 1 Chiều & Bảng Phân Phối File Rules (One-Way Rule Dispatching):**
    - Agent Chính **CHỈ TRUYỀN DUY NHẤT** đường dẫn file rules của vai trò tương ứng:
 
-| Vai Trò | Cấp Bậc (Tier) | Kích Hoạt (Trigger) | Model Khuyến Nghị | Đường Dẫn File Rules Bắt Buộc | Mã Xác Thực Canary (Turn 1) |
+| Vai Trò | Cấp Bậc (Tier) | Kích Hoạt (Trigger) | Model Bắt Buộc (Model Xịn Nhất) | Đường Dẫn File Rules Bắt Buộc | Mã Xác Thực Canary (Turn 1) |
 |---|---|---|---|---|---|
-| **Lead PM** (Enterprise Meta-Orchestrator) | **Tier 1.5** | CHỈ khi Sếp gõ lệnh /leadpm | **Pro** (Gemini 3.1 Pro) | `rules/enterprise-hooks/rules_by_role/lead_pm/LEAD_PM_RULES.md` | `CANARY_VERIFIED: §PM-ROLE-BOUNDARY` hoặc `§LEAD-PM-META-ORCHESTRATOR` |
-| **PM Thường** (Project Orchestrator) | **Tier 2** | Lệnh `/pm` hoặc task vừa/nhỏ | **Flash** (`high`) / **Pro** | `rules/enterprise-hooks/rules_by_role/pm_orchestrator/PM_RULES.md` | `CANARY_VERIFIED: §PM-ROLE-BOUNDARY` |
-| **PM Plan Challenger** | **Tier 1.5** | Tự động tại Gate 4 | **Pro** (High Reasoning) | `rules/enterprise-hooks/rules_by_role/pm_challenger/PM_CHALLENGER_RULES.md` | `CANARY_VERIFIED: §PM-CHALLENGER-AUDITOR` |
-| **Lead Watchdog** | **Tier 1.5** | Tự động đi kèm Lead PM | **Flash** | `rules/enterprise-hooks/rules_by_role/lead_watchdog/LEAD_WATCHDOG_RULES.md` | `CANARY_VERIFIED: §LEAD-WATCHDOG-TELEMETRY-OBSERVER` |
-| **Fleet / Domain Watchdog** | **Tier 1.5 / Tier 2** | Giám sát viễn trắc hệ thống | **Flash** | `rules/enterprise-hooks/rules_by_role/watchdog_inspector/WATCHDOG_RULES.md` | `CANARY_VERIFIED: §WATCHDOG-TELEMETRY-OBSERVER` |
+| **Lead PM** (Enterprise Meta-Orchestrator) | **Tier 1.5** | CHỈ khi Sếp gõ lệnh /leadpm | **`inherit`** / **`pro`** (High Reasoning) | `rules/rules_by_role/lead_pm/LEAD_PM_RULES_INDEX.md` | `CANARY_VERIFIED: §PM-ROLE-BOUNDARY` hoặc `§LEAD-PM-META-ORCHESTRATOR` |
+| **PM Thường** (Project Orchestrator) | **Tier 2** | Lệnh `/pm` hoặc task vừa/nhỏ | **`inherit`** / **`pro`** (High Reasoning) | `rules/rules_by_role/pm_orchestrator/PM_RULES.md` | `CANARY_VERIFIED: §PM-ROLE-BOUNDARY` |
+| **PM Plan Challenger** | **Tier 1.5** | Tự động tại Gate 4 | **`inherit`** / **`pro`** (High Reasoning) | `rules/rules_by_role/pm_challenger/PM_CHALLENGER_RULES.md` | `CANARY_VERIFIED: §PM-CHALLENGER-AUDITOR` |
+| **Lead Watchdog** | **Tier 1.5** | Tự động đi kèm Lead PM | **`inherit`** / **`pro`** (High Reasoning) | `rules/rules_by_role/lead_watchdog/LEAD_WATCHDOG_RULES.md` | `CANARY_VERIFIED: §LEAD-WATCHDOG-TELEMETRY-OBSERVER` |
+| **Fleet / Domain Watchdog** | **Tier 1.5 / Tier 2** | Giám sát viễn trắc hệ thống | **`inherit`** / **`pro`** (High Reasoning) | `rules/rules_by_role/watchdog_inspector/WATCHDOG_RULES.md` | `CANARY_VERIFIED: §WATCHDOG-TELEMETRY-OBSERVER` |
 
    - **Rào Cản Token (CẤM Agent Chính):** CẤM nạp 29 tiêu chuẩn code, 10 Tầng Pre-Flight, 57 hooks, DEV_RULES Tier 3. Toàn bộ quản lý kỹ thuật do Lead PM / PM Thường phụ trách.
 

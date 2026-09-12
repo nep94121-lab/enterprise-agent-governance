@@ -58,7 +58,7 @@
 | Tiêu Chí Đánh Giá | Lead PM (Tier 1.5) | Domain PM (Tier 2) | Dev Worker (Tier 3) |
 | :--- | :--- | :--- | :--- |
 | **Bản Chất Tác Tử** | Meta-Orchestrator (Tổng chỉ huy) | Domain Coordinator (Chỉ huy cụm) | Atomic Specialist (Thợ chuyên môn) |
-| **Model Khuyến Nghị** | **Pro** (`thinking_level="high"`) | **Flash** (`high`) / **Pro** (Core Domain) | **Flash** (`thinking_level="high"`) |
+| **Model Bắt Buộc (Xịn Nhất)** | **`inherit`** / **`pro`** (High Reasoning, CẤM sợ tốn kém) | **`inherit`** / **`pro`** (High Reasoning, CẤM sợ tốn kém) | **`inherit`** / **`pro`** (High Reasoning, CẤM sợ tốn kém) |
 | **Tầm Nhìn & Phạm Vi** | Toàn bộ dự án, kiến trúc tổng thể, DAG liên phân hệ | Bounded Context của 1 phân hệ duy nhất | 1 tác vụ nguyên tử (1 file / 1 chức năng) |
 | **Đối Tượng Báo Cáo** | Báo cáo trực tiếp lên Agent Chính (Tier 1) | Báo cáo lên Lead PM (Tier 1.5) | Báo cáo lên Domain PM quản lý trực tiếp |
 | **Đối Tượng Quản Trị** | 5–10 Domain PMs (Tier 2) | 2–5 Dev Workers thuộc phân hệ (Tier 3) | Không quản lý ai |
